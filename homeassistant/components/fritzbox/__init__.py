@@ -1,114 +1,78 @@
-"""Support for AVM Fritz!Box smarthome devices."""
-import asyncio
-import socket
+"""Support for AVM FRITZ!SmartHome devices."""
 
-from pyfritzhome import Fritzhome
-import voluptuous as vol
+from __future__ import annotations
 
-from homeassistant.const import (
-    CONF_DEVICES,
-    CONF_HOST,
-    CONF_PASSWORD,
-    CONF_USERNAME,
-    EVENT_HOMEASSISTANT_STOP,
-)
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, UnitOfTemperature
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers.entity_registry import RegistryEntry, async_migrate_entries
 
-from .const import CONF_CONNECTIONS, DEFAULT_HOST, DEFAULT_USERNAME, DOMAIN, PLATFORMS
+from .const import DOMAIN, LOGGER, PLATFORMS
+from .coordinator import FritzboxConfigEntry, FritzboxDataUpdateCoordinator
 
 
-def ensure_unique_hosts(value):
-    """Validate that all configs have a unique host."""
-    vol.Schema(vol.Unique("duplicate host entries found"))(
-        [socket.gethostbyname(entry[CONF_HOST]) for entry in value]
-    )
-    return value
+async def async_setup_entry(hass: HomeAssistant, entry: FritzboxConfigEntry) -> bool:
+    """Set up the AVM FRITZ!SmartHome platforms."""
 
-
-CONFIG_SCHEMA = vol.Schema(
-    vol.All(
-        cv.deprecated(DOMAIN),
-        {
-            DOMAIN: vol.Schema(
-                {
-                    vol.Required(CONF_DEVICES): vol.All(
-                        cv.ensure_list,
-                        [
-                            vol.Schema(
-                                {
-                                    vol.Required(
-                                        CONF_HOST, default=DEFAULT_HOST
-                                    ): cv.string,
-                                    vol.Required(CONF_PASSWORD): cv.string,
-                                    vol.Required(
-                                        CONF_USERNAME, default=DEFAULT_USERNAME
-                                    ): cv.string,
-                                }
-                            )
-                        ],
-                        ensure_unique_hosts,
-                    )
-                }
+    def _update_unique_id(entry: RegistryEntry) -> dict[str, str] | None:
+        """Update unique ID of entity entry."""
+        if (
+            entry.unit_of_measurement == UnitOfTemperature.CELSIUS
+            and "_temperature" not in entry.unique_id
+        ):
+            new_unique_id = f"{entry.unique_id}_temperature"
+            LOGGER.debug(
+                "Migrating unique_id [%s] to [%s]", entry.unique_id, new_unique_id
             )
-        },
-    ),
-    extra=vol.ALLOW_EXTRA,
-)
+            return {"new_unique_id": new_unique_id}
 
-
-async def async_setup(hass, config):
-    """Set up the AVM Fritz!Box integration."""
-    if DOMAIN in config:
-        for entry_config in config[DOMAIN][CONF_DEVICES]:
-            hass.async_create_task(
-                hass.config_entries.flow.async_init(
-                    DOMAIN, context={"source": "import"}, data=entry_config
-                )
+        if entry.domain == BINARY_SENSOR_DOMAIN and "_" not in entry.unique_id:
+            new_unique_id = f"{entry.unique_id}_alarm"
+            LOGGER.debug(
+                "Migrating unique_id [%s] to [%s]", entry.unique_id, new_unique_id
             )
+            return {"new_unique_id": new_unique_id}
+        return None
 
-    return True
+    await async_migrate_entries(hass, entry.entry_id, _update_unique_id)
 
+    coordinator = FritzboxDataUpdateCoordinator(hass, entry.entry_id)
+    await coordinator.async_setup()
 
-async def async_setup_entry(hass, entry):
-    """Set up the AVM Fritz!Box platforms."""
-    fritz = Fritzhome(
-        host=entry.data[CONF_HOST],
-        user=entry.data[CONF_USERNAME],
-        password=entry.data[CONF_PASSWORD],
-    )
-    await hass.async_add_executor_job(fritz.login)
+    entry.runtime_data = coordinator
 
-    hass.data.setdefault(DOMAIN, {CONF_CONNECTIONS: {}, CONF_DEVICES: set()})
-    hass.data[DOMAIN][CONF_CONNECTIONS][entry.entry_id] = fritz
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    for component in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
-        )
-
-    def logout_fritzbox(event):
+    def logout_fritzbox(event: Event) -> None:
         """Close connections to this fritzbox."""
-        fritz.logout()
+        coordinator.fritz.logout()
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, logout_fritzbox)
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, logout_fritzbox)
+    )
 
     return True
 
 
-async def async_unload_entry(hass, entry):
-    """Unloading the AVM Fritz!Box platforms."""
-    fritz = hass.data[DOMAIN][CONF_CONNECTIONS][entry.entry_id]
-    await hass.async_add_executor_job(fritz.logout)
+async def async_unload_entry(hass: HomeAssistant, entry: FritzboxConfigEntry) -> bool:
+    """Unloading the AVM FRITZ!SmartHome platforms."""
+    await hass.async_add_executor_job(entry.runtime_data.fritz.logout)
 
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in PLATFORMS
-            ]
-        )
-    )
-    if unload_ok:
-        hass.data[DOMAIN][CONF_CONNECTIONS].pop(entry.entry_id)
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    return unload_ok
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: FritzboxConfigEntry, device: DeviceEntry
+) -> bool:
+    """Remove Fritzbox config entry from a device."""
+    coordinator = entry.runtime_data
+
+    for identifier in device.identifiers:
+        if identifier[0] == DOMAIN and (
+            identifier[1] in coordinator.data.devices
+            or identifier[1] in coordinator.data.templates
+        ):
+            return False
+
+    return True

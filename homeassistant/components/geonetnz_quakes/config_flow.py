@@ -1,9 +1,11 @@
 """Config flow to configure the GeoNet NZ Quakes integration."""
+
 import logging
+from typing import Any
 
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import (
     CONF_LATITUDE,
     CONF_LONGITUDE,
@@ -12,7 +14,7 @@ from homeassistant.const import (
 )
 from homeassistant.helpers import config_validation as cv
 
-from .const import (  # pylint: disable=unused-import
+from .const import (
     CONF_MINIMUM_MAGNITUDE,
     CONF_MMI,
     DEFAULT_MINIMUM_MAGNITUDE,
@@ -34,10 +36,8 @@ DATA_SCHEMA = vol.Schema(
 _LOGGER = logging.getLogger(__name__)
 
 
-class GeonetnzQuakesFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class GeonetnzQuakesFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a GeoNet NZ Quakes config flow."""
-
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
 
     async def _show_form(self, errors=None):
         """Show the form to the user."""
@@ -45,11 +45,13 @@ class GeonetnzQuakesFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=DATA_SCHEMA, errors=errors or {}
         )
 
-    async def async_step_import(self, import_config):
+    async def async_step_import(self, import_data: dict[str, Any]) -> ConfigFlowResult:
         """Import a config entry from configuration.yaml."""
-        return await self.async_step_user(import_config)
+        return await self.async_step_user(import_data)
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the start of the config flow."""
         _LOGGER.debug("User input: %s", user_input)
         if not user_input:
@@ -66,7 +68,7 @@ class GeonetnzQuakesFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
 
         scan_interval = user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        user_input[CONF_SCAN_INTERVAL] = scan_interval.seconds
+        user_input[CONF_SCAN_INTERVAL] = scan_interval.total_seconds()
 
         minimum_magnitude = user_input.get(
             CONF_MINIMUM_MAGNITUDE, DEFAULT_MINIMUM_MAGNITUDE

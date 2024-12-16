@@ -1,25 +1,24 @@
 """Sensor for displaying the number of result from Flume."""
-from datetime import timedelta
-import logging
 
-from pyflume import FlumeData
-import voluptuous as vol
+from typing import Any
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.config_entries import SOURCE_IMPORT
-from homeassistant.const import (
-    CONF_CLIENT_ID,
-    CONF_CLIENT_SECRET,
-    CONF_NAME,
-    CONF_PASSWORD,
-    CONF_USERNAME,
+from pyflume import FlumeAuth, FlumeData
+from requests import Session
+
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
 )
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
-from homeassistant.util import Throttle
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfVolume
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import StateType
 
 from .const import (
-    DEFAULT_NAME,
+    DEVICE_SCAN_INTERVAL,
     DOMAIN,
     FLUME_AUTH,
     FLUME_DEVICES,
@@ -28,135 +27,142 @@ from .const import (
     KEY_DEVICE_ID,
     KEY_DEVICE_LOCATION,
     KEY_DEVICE_LOCATION_NAME,
+    KEY_DEVICE_LOCATION_TIMEZONE,
     KEY_DEVICE_TYPE,
 )
+from .coordinator import FlumeDeviceDataUpdateCoordinator
+from .entity import FlumeEntity
+from .util import get_valid_flume_devices
 
-_LOGGER = logging.getLogger(__name__)
-
-MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=15)
-SCAN_INTERVAL = timedelta(minutes=1)
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Required(CONF_CLIENT_ID): cv.string,
-        vol.Required(CONF_CLIENT_SECRET): cv.string,
-        vol.Optional(CONF_NAME): cv.string,
-    }
+FLUME_QUERIES_SENSOR: tuple[SensorEntityDescription, ...] = (
+    SensorEntityDescription(
+        key="current_interval",
+        translation_key="current_interval",
+        suggested_display_precision=2,
+        native_unit_of_measurement=f"{UnitOfVolume.GALLONS}/m",
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorEntityDescription(
+        key="month_to_date",
+        translation_key="month_to_date",
+        suggested_display_precision=2,
+        native_unit_of_measurement=UnitOfVolume.GALLONS,
+        device_class=SensorDeviceClass.WATER,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    SensorEntityDescription(
+        key="week_to_date",
+        translation_key="week_to_date",
+        suggested_display_precision=2,
+        native_unit_of_measurement=UnitOfVolume.GALLONS,
+        device_class=SensorDeviceClass.WATER,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    SensorEntityDescription(
+        key="today",
+        translation_key="today",
+        suggested_display_precision=2,
+        native_unit_of_measurement=UnitOfVolume.GALLONS,
+        device_class=SensorDeviceClass.WATER,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    SensorEntityDescription(
+        key="last_60_min",
+        translation_key="last_60_min",
+        suggested_display_precision=2,
+        native_unit_of_measurement=f"{UnitOfVolume.GALLONS}/h",
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorEntityDescription(
+        key="last_24_hrs",
+        translation_key="last_24_hrs",
+        suggested_display_precision=2,
+        native_unit_of_measurement=f"{UnitOfVolume.GALLONS}/d",
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorEntityDescription(
+        key="last_30_days",
+        translation_key="last_30_days",
+        suggested_display_precision=2,
+        native_unit_of_measurement=f"{UnitOfVolume.GALLONS}/mo",
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
 )
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Import the platform into a config entry."""
-
-    hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": SOURCE_IMPORT}, data=config
-        )
-    )
-
-
-async def async_setup_entry(hass, config_entry, async_add_entities):
-    """Set up the Flume sensor."""
-
-    flume_domain_data = hass.data[DOMAIN][config_entry.entry_id]
-
-    flume_auth = flume_domain_data[FLUME_AUTH]
-    http_session = flume_domain_data[FLUME_HTTP_SESSION]
-    flume_devices = flume_domain_data[FLUME_DEVICES]
-
-    config = config_entry.data
-    name = config.get(CONF_NAME, DEFAULT_NAME)
-
-    flume_entity_list = []
-    for device in flume_devices.device_list:
-        if device[KEY_DEVICE_TYPE] != FLUME_TYPE_SENSOR:
-            continue
-
+def make_flume_datas(
+    http_session: Session, flume_auth: FlumeAuth, flume_devices: list[dict[str, Any]]
+) -> dict[str, FlumeData]:
+    """Create FlumeData objects for each device."""
+    flume_datas: dict[str, FlumeData] = {}
+    for device in flume_devices:
         device_id = device[KEY_DEVICE_ID]
-        device_name = device[KEY_DEVICE_LOCATION][KEY_DEVICE_LOCATION_NAME]
-        device_friendly_name = f"{name} {device_name}"
-        flume_device = FlumeData(
+        device_timezone = device[KEY_DEVICE_LOCATION][KEY_DEVICE_LOCATION_TIMEZONE]
+        flume_data = FlumeData(
             flume_auth,
             device_id,
-            SCAN_INTERVAL,
+            device_timezone,
+            scan_interval=DEVICE_SCAN_INTERVAL,
             update_on_init=False,
             http_session=http_session,
         )
-        flume_entity_list.append(
-            FlumeSensor(flume_device, device_friendly_name, device_id)
+        flume_datas[device_id] = flume_data
+    return flume_datas
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up the Flume sensor."""
+
+    flume_domain_data = hass.data[DOMAIN][config_entry.entry_id]
+    flume_devices = flume_domain_data[FLUME_DEVICES]
+    flume_auth: FlumeAuth = flume_domain_data[FLUME_AUTH]
+    http_session: Session = flume_domain_data[FLUME_HTTP_SESSION]
+    flume_devices = [
+        device
+        for device in get_valid_flume_devices(flume_devices)
+        if device[KEY_DEVICE_TYPE] == FLUME_TYPE_SENSOR
+    ]
+    flume_entity_list: list[FlumeSensor] = []
+    flume_datas = await hass.async_add_executor_job(
+        make_flume_datas, http_session, flume_auth, flume_devices
+    )
+
+    for device in flume_devices:
+        device_id: str = device[KEY_DEVICE_ID]
+        device_location_name = device[KEY_DEVICE_LOCATION][KEY_DEVICE_LOCATION_NAME]
+        flume_device = flume_datas[device_id]
+
+        coordinator = FlumeDeviceDataUpdateCoordinator(
+            hass=hass, flume_device=flume_device
         )
 
-    if flume_entity_list:
-        async_add_entities(flume_entity_list)
+        flume_entity_list.extend(
+            [
+                FlumeSensor(
+                    coordinator=coordinator,
+                    description=description,
+                    device_id=device_id,
+                    location_name=device_location_name,
+                )
+                for description in FLUME_QUERIES_SENSOR
+            ]
+        )
+
+    async_add_entities(flume_entity_list)
 
 
-class FlumeSensor(Entity):
+class FlumeSensor(FlumeEntity[FlumeDeviceDataUpdateCoordinator], SensorEntity):
     """Representation of the Flume sensor."""
 
-    def __init__(self, flume_device, name, device_id):
-        """Initialize the Flume sensor."""
-        self._flume_device = flume_device
-        self._name = name
-        self._device_id = device_id
-        self._undo_track_sensor = None
-        self._available = False
-        self._state = None
-
     @property
-    def device_info(self):
-        """Device info for the flume sensor."""
-        return {
-            "name": self._name,
-            "identifiers": {(DOMAIN, self._device_id)},
-            "manufacturer": "Flume, Inc.",
-            "model": "Flume Smart Water Monitor",
-        }
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def state(self):
+    def native_value(self) -> StateType:
         """Return the state of the sensor."""
-        return self._state
+        sensor_key = self.entity_description.key
+        if sensor_key not in self.coordinator.flume_device.values:
+            return None
 
-    @property
-    def unit_of_measurement(self):
-        """Return the unit the value is expressed in."""
-        # This is in gallons per SCAN_INTERVAL
-        return "gal/m"
-
-    @property
-    def available(self):
-        """Device is available."""
-        return self._available
-
-    @property
-    def unique_id(self):
-        """Device unique ID."""
-        return self._device_id
-
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    def update(self):
-        """Get the latest data and updates the states."""
-        _LOGGER.debug("Updating flume sensor: %s", self._name)
-        try:
-            self._flume_device.update_force()
-        except Exception as ex:  # pylint: disable=broad-except
-            if self._available:
-                _LOGGER.error("Update of flume sensor %s failed: %s", self._name, ex)
-            self._available = False
-            return
-        _LOGGER.debug("Successful update of flume sensor: %s", self._name)
-        self._state = self._flume_device.value
-        self._available = True
-
-    async def async_added_to_hass(self):
-        """Request an update when added."""
-        # We do ask for an update with async_add_entities()
-        # because it will update disabled entities
-        self.async_schedule_update_ha_state()
+        return self.coordinator.flume_device.values[sensor_key]

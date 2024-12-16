@@ -1,9 +1,10 @@
 {
   "domain": "homematicip_cloud",
   "name": "HomematicIP Cloud",
+  "codeowners": ["@hahn-th"],
   "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/homematicip_cloud",
-  "requirements": ["homematicip==0.10.18"],
-  "codeowners": ["@SukramJ"],
-  "quality_scale": "platinum"
+  "iot_class": "cloud_push",
+  "loggers": ["homematicip"],
+  "requirements": ["homematicip==1.1.5"]
 }

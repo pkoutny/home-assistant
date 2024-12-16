@@ -1,103 +1,152 @@
 """Plugwise Binary Sensor component for Home Assistant."""
 
-import logging
+from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
-from homeassistant.const import STATE_OFF, STATE_ON
-from homeassistant.core import callback
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
 
-from .const import DOMAIN, FLAME_ICON, FLOW_OFF_ICON, FLOW_ON_ICON, IDLE_ICON
-from .sensor import SmileSensor
+from plugwise.constants import BinarySensorType
 
-BINARY_SENSOR_MAP = {
-    "dhw_state": ["Domestic Hot Water State", None],
-    "slave_boiler_state": ["Secondary Heater Device State", None],
-}
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-_LOGGER = logging.getLogger(__name__)
+from . import PlugwiseConfigEntry
+from .coordinator import PlugwiseDataUpdateCoordinator
+from .entity import PlugwiseEntity
+
+SEVERITIES = ["other", "info", "warning", "error"]
+
+# Coordinator is used to centralize the data updates
+PARALLEL_UPDATES = 0
 
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
+@dataclass(frozen=True)
+class PlugwiseBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Describes a Plugwise binary sensor entity."""
+
+    key: BinarySensorType
+
+
+BINARY_SENSORS: tuple[PlugwiseBinarySensorEntityDescription, ...] = (
+    PlugwiseBinarySensorEntityDescription(
+        key="low_battery",
+        device_class=BinarySensorDeviceClass.BATTERY,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="compressor_state",
+        translation_key="compressor_state",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="cooling_enabled",
+        translation_key="cooling_enabled",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="dhw_state",
+        translation_key="dhw_state",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="flame_state",
+        translation_key="flame_state",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="heating_state",
+        translation_key="heating_state",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="cooling_state",
+        translation_key="cooling_state",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="secondary_boiler_state",
+        translation_key="secondary_boiler_state",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    PlugwiseBinarySensorEntityDescription(
+        key="plugwise_notification",
+        translation_key="plugwise_notification",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: PlugwiseConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
     """Set up the Smile binary_sensors from a config entry."""
-    api = hass.data[DOMAIN][config_entry.entry_id]["api"]
-    coordinator = hass.data[DOMAIN][config_entry.entry_id]["coordinator"]
-
-    entities = []
-
-    all_devices = api.get_all_devices()
-    for dev_id, device_properties in all_devices.items():
-        if device_properties["class"] != "heater_central":
-            continue
-
-        data = api.get_device_data(dev_id)
-        for binary_sensor, dummy in BINARY_SENSOR_MAP.items():
-            if binary_sensor not in data:
-                continue
-
-            entities.append(
-                PwBinarySensor(
-                    api,
-                    coordinator,
-                    device_properties["name"],
-                    binary_sensor,
-                    dev_id,
-                    device_properties["class"],
-                )
-            )
-
-    async_add_entities(entities, True)
-
-
-class PwBinarySensor(SmileSensor, BinarySensorEntity):
-    """Representation of a Plugwise binary_sensor."""
-
-    def __init__(self, api, coordinator, name, binary_sensor, dev_id, model):
-        """Set up the Plugwise API."""
-        super().__init__(api, coordinator, name, dev_id, binary_sensor)
-
-        self._binary_sensor = binary_sensor
-
-        self._is_on = False
-        self._icon = None
-
-        self._unique_id = f"{dev_id}-{binary_sensor}"
-
-    @property
-    def is_on(self):
-        """Return true if the binary sensor is on."""
-        return self._is_on
-
-    @property
-    def icon(self):
-        """Return the icon to use in the frontend."""
-        return self._icon
+    coordinator = entry.runtime_data
 
     @callback
-    def _async_process_data(self):
-        """Update the entity."""
-        data = self._api.get_device_data(self._dev_id)
-
-        if not data:
-            _LOGGER.error("Received no data for device %s", self._binary_sensor)
-            self.async_write_ha_state()
+    def _add_entities() -> None:
+        """Add Entities."""
+        if not coordinator.new_devices:
             return
 
-        if self._binary_sensor not in data:
-            self.async_write_ha_state()
-            return
+        async_add_entities(
+            PlugwiseBinarySensorEntity(coordinator, device_id, description)
+            for device_id in coordinator.new_devices
+            if (
+                binary_sensors := coordinator.data.devices[device_id].get(
+                    "binary_sensors"
+                )
+            )
+            for description in BINARY_SENSORS
+            if description.key in binary_sensors
+        )
 
-        self._is_on = data[self._binary_sensor]
+    _add_entities()
+    entry.async_on_unload(coordinator.async_add_listener(_add_entities))
 
-        self._state = STATE_OFF
-        if self._binary_sensor == "dhw_state":
-            self._icon = FLOW_OFF_ICON
-        if self._binary_sensor == "slave_boiler_state":
-            self._icon = IDLE_ICON
-        if self._is_on:
-            self._state = STATE_ON
-            if self._binary_sensor == "dhw_state":
-                self._icon = FLOW_ON_ICON
-            if self._binary_sensor == "slave_boiler_state":
-                self._icon = FLAME_ICON
 
-        self.async_write_ha_state()
+class PlugwiseBinarySensorEntity(PlugwiseEntity, BinarySensorEntity):
+    """Represent Smile Binary Sensors."""
+
+    entity_description: PlugwiseBinarySensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: PlugwiseDataUpdateCoordinator,
+        device_id: str,
+        description: PlugwiseBinarySensorEntityDescription,
+    ) -> None:
+        """Initialise the binary_sensor."""
+        super().__init__(coordinator, device_id)
+        self.entity_description = description
+        self._attr_unique_id = f"{device_id}-{description.key}"
+
+    @property
+    def is_on(self) -> bool:
+        """Return true if the binary sensor is on."""
+        return self.device["binary_sensors"][self.entity_description.key]
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        """Return entity specific state attributes."""
+        if self.entity_description.key != "plugwise_notification":
+            return None
+
+        attrs: dict[str, list[str]] = {f"{severity}_msg": [] for severity in SEVERITIES}
+        if notify := self.coordinator.data.gateway["notifications"]:
+            for details in notify.values():
+                for msg_type, msg in details.items():
+                    msg_type = msg_type.lower()
+                    if msg_type not in SEVERITIES:
+                        msg_type = "other"
+                    attrs[f"{msg_type}_msg"].append(msg)
+
+        return attrs

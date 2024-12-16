@@ -1,18 +1,21 @@
 """Find translation keys that are in Lokalise but no longer defined in source."""
+
 import argparse
-import json
 
 from .const import CORE_PROJECT_ID, FRONTEND_DIR, FRONTEND_PROJECT_ID, INTEGRATIONS_DIR
 from .error import ExitApp
 from .lokalise import get_api
-from .util import get_base_arg_parser
+from .util import get_base_arg_parser, load_json_from_path
 
 
 def get_arguments() -> argparse.Namespace:
     """Get parsed passed in arguments."""
     parser = get_base_arg_parser()
     parser.add_argument(
-        "--target", type=str, default="core", choices=["core", "frontend"],
+        "--target",
+        type=str,
+        default="core",
+        choices=["core", "frontend"],
     )
     return parser.parse_args()
 
@@ -43,8 +46,11 @@ def find_core():
 
         translations = int_dir / "translations" / "en.json"
 
-        strings_json = json.loads(strings.read_text())
-        translations_json = json.loads(translations.read_text())
+        strings_json = load_json_from_path(strings)
+        if translations.is_file():
+            translations_json = load_json_from_path(translations)
+        else:
+            translations_json = {}
 
         find_extra(
             strings_json, translations_json, f"component::{int_dir.name}", missing_keys
@@ -59,12 +65,12 @@ def find_frontend():
         raise ExitApp(f"Unable to find frontend at {FRONTEND_DIR}")
 
     source = FRONTEND_DIR / "src/translations/en.json"
-    translated = FRONTEND_DIR / "translations/en.json"
+    translated = FRONTEND_DIR / "translations/frontend/en.json"
 
     missing_keys = []
     find_extra(
-        json.loads(source.read_text()),
-        json.loads(translated.read_text()),
+        load_json_from_path(source),
+        load_json_from_path(translated),
         "",
         missing_keys,
     )
@@ -85,22 +91,29 @@ def run():
         print("No missing translations!")
         return 0
 
-    key_data = lokalise.keys_list(
-        {"filter_keys": ",".join(missing_keys), "limit": 1000}
-    )
-    if len(key_data) != len(missing_keys):
-        print(
-            f"Lookin up key in Lokalise returns {len(key_data)} results, expected {len(missing_keys)}"
-        )
-        return 1
+    print(f"Found {len(missing_keys)} extra keys")
 
-    print(f"Deleting {len(missing_keys)} keys:")
-    for key in missing_keys:
-        print(" -", key)
-    print()
-    while input("Type YES to delete these keys: ") != "YES":
-        pass
+    # We can't query too many keys at once, so limit the number to 50.
+    for i in range(0, len(missing_keys), 50):
+        chunk = missing_keys[i : i + 50]
 
-    print(lokalise.keys_delete_multiple([key["key_id"] for key in key_data]))
+        key_data = lokalise.keys_list({"filter_keys": ",".join(chunk), "limit": 1000})
+        if len(key_data) != len(chunk):
+            print(
+                f"Looking up key in Lokalise returns {len(key_data)} results, expected {len(chunk)}"
+            )
+
+        if not key_data:
+            continue
+
+        print(f"Deleting {len(key_data)} keys:")
+        for key in key_data:
+            print(" -", key["key_name"]["web"])
+        print()
+        while input("Type YES to delete these keys: ") != "YES":
+            pass
+
+        print(lokalise.keys_delete_multiple([key["key_id"] for key in key_data]))
+        print()
 
     return 0

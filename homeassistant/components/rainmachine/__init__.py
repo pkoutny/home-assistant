@@ -1,459 +1,528 @@
 """Support for RainMachine devices."""
-import asyncio
+
+from __future__ import annotations
+
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import timedelta
-import logging
+from functools import partial, wraps
+from typing import Any, cast
 
 from regenmaschine import Client
-from regenmaschine.errors import RainMachineError
+from regenmaschine.controller import Controller
+from regenmaschine.errors import RainMachineError, UnknownAPICallError
 import voluptuous as vol
 
-from homeassistant.config_entries import SOURCE_IMPORT
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
-    ATTR_ATTRIBUTION,
+    CONF_DEVICE_ID,
     CONF_IP_ADDRESS,
     CONF_PASSWORD,
     CONF_PORT,
-    CONF_SCAN_INTERVAL,
     CONF_SSL,
+    CONF_UNIT_OF_MEASUREMENT,
+    Platform,
 )
-from homeassistant.core import callback
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import aiohttp_client, config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.service import verify_domain_control
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import (
+    aiohttp_client,
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util.dt import as_timestamp, utcnow
+from homeassistant.util.network import is_ip_address
 
+from .config_flow import get_client_controller
 from .const import (
-    CONF_ZONE_RUN_TIME,
-    DATA_CLIENT,
+    CONF_ALLOW_INACTIVE_ZONES_TO_RUN,
+    CONF_DEFAULT_ZONE_RUN_TIME,
+    CONF_DURATION,
+    CONF_USE_APP_RUN_TIMES,
+    DATA_API_VERSIONS,
+    DATA_MACHINE_FIRMWARE_UPDATE_STATUS,
     DATA_PROGRAMS,
     DATA_PROVISION_SETTINGS,
     DATA_RESTRICTIONS_CURRENT,
     DATA_RESTRICTIONS_UNIVERSAL,
     DATA_ZONES,
-    DATA_ZONES_DETAILS,
-    DEFAULT_PORT,
-    DEFAULT_SCAN_INTERVAL,
     DEFAULT_ZONE_RUN,
     DOMAIN,
-    PROGRAM_UPDATE_TOPIC,
-    SENSOR_UPDATE_TOPIC,
-    ZONE_UPDATE_TOPIC,
+    LOGGER,
 )
+from .coordinator import RainMachineDataUpdateCoordinator
 
-_LOGGER = logging.getLogger(__name__)
-
-CONF_CONTROLLERS = "controllers"
-CONF_PROGRAM_ID = "program_id"
-CONF_SECONDS = "seconds"
-CONF_ZONE_ID = "zone_id"
-
-DEFAULT_ATTRIBUTION = "Data provided by Green Electronics LLC"
-DEFAULT_ICON = "mdi:water"
 DEFAULT_SSL = True
 
-SERVICE_ALTER_PROGRAM = vol.Schema({vol.Required(CONF_PROGRAM_ID): cv.positive_int})
 
-SERVICE_ALTER_ZONE = vol.Schema({vol.Required(CONF_ZONE_ID): cv.positive_int})
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.UPDATE,
+]
 
-SERVICE_PAUSE_WATERING = vol.Schema({vol.Required(CONF_SECONDS): cv.positive_int})
+CONF_CONDITION = "condition"
+CONF_DEWPOINT = "dewpoint"
+CONF_ET = "et"
+CONF_MAXRH = "maxrh"
+CONF_MAXTEMP = "maxtemp"
+CONF_MINRH = "minrh"
+CONF_MINTEMP = "mintemp"
+CONF_PRESSURE = "pressure"
+CONF_QPF = "qpf"
+CONF_RAIN = "rain"
+CONF_SECONDS = "seconds"
+CONF_SOLARRAD = "solarrad"
+CONF_TEMPERATURE = "temperature"
+CONF_TIMESTAMP = "timestamp"
+CONF_UNITS = "units"
+CONF_VALUE = "value"
+CONF_WEATHER = "weather"
+CONF_WIND = "wind"
 
-SERVICE_START_PROGRAM_SCHEMA = vol.Schema(
-    {vol.Required(CONF_PROGRAM_ID): cv.positive_int}
-)
+# Config Validator for Flow Meter Data
+CV_FLOW_METER_VALID_UNITS = {
+    "clicks",
+    "gal",
+    "litre",
+    "m3",
+}
 
-SERVICE_START_ZONE_SCHEMA = vol.Schema(
+# Config Validators for Weather Service Data
+CV_WX_DATA_VALID_PERCENTAGE = vol.All(vol.Coerce(int), vol.Range(min=0, max=100))
+CV_WX_DATA_VALID_TEMP_RANGE = vol.All(vol.Coerce(float), vol.Range(min=-40.0, max=40.0))
+CV_WX_DATA_VALID_RAIN_RANGE = vol.All(vol.Coerce(float), vol.Range(min=0.0, max=1000.0))
+CV_WX_DATA_VALID_WIND_SPEED = vol.All(vol.Coerce(float), vol.Range(min=0.0, max=65.0))
+CV_WX_DATA_VALID_PRESSURE = vol.All(vol.Coerce(float), vol.Range(min=60.0, max=110.0))
+CV_WX_DATA_VALID_SOLARRAD = vol.All(vol.Coerce(float), vol.Range(min=0.0, max=5.0))
+
+SERVICE_NAME_PAUSE_WATERING = "pause_watering"
+SERVICE_NAME_PUSH_FLOW_METER_DATA = "push_flow_meter_data"
+SERVICE_NAME_PUSH_WEATHER_DATA = "push_weather_data"
+SERVICE_NAME_RESTRICT_WATERING = "restrict_watering"
+SERVICE_NAME_STOP_ALL = "stop_all"
+SERVICE_NAME_UNPAUSE_WATERING = "unpause_watering"
+SERVICE_NAME_UNRESTRICT_WATERING = "unrestrict_watering"
+
+SERVICE_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_ZONE_ID): cv.positive_int,
-        vol.Optional(CONF_ZONE_RUN_TIME, default=DEFAULT_ZONE_RUN): cv.positive_int,
+        vol.Required(CONF_DEVICE_ID): cv.string,
     }
 )
 
-SERVICE_STOP_PROGRAM_SCHEMA = vol.Schema(
-    {vol.Required(CONF_PROGRAM_ID): cv.positive_int}
+SERVICE_PAUSE_WATERING_SCHEMA = SERVICE_SCHEMA.extend(
+    {
+        vol.Required(CONF_SECONDS): cv.positive_int,
+    }
 )
 
-SERVICE_STOP_ZONE_SCHEMA = vol.Schema({vol.Required(CONF_ZONE_ID): cv.positive_int})
-
-CONTROLLER_SCHEMA = vol.Schema(
+SERVICE_PUSH_FLOW_METER_DATA_SCHEMA = SERVICE_SCHEMA.extend(
     {
-        vol.Required(CONF_IP_ADDRESS): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
-        vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): vol.All(
-            cv.time_period, lambda value: value.total_seconds()
+        vol.Required(CONF_VALUE): cv.positive_float,
+        vol.Optional(CONF_UNIT_OF_MEASUREMENT): vol.All(
+            cv.string, vol.In(CV_FLOW_METER_VALID_UNITS)
         ),
-        vol.Optional(CONF_ZONE_RUN_TIME, default=DEFAULT_ZONE_RUN): cv.positive_int,
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
+SERVICE_PUSH_WEATHER_DATA_SCHEMA = SERVICE_SCHEMA.extend(
     {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_CONTROLLERS): vol.All(
-                    cv.ensure_list, [CONTROLLER_SCHEMA]
-                )
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
+        vol.Optional(CONF_TIMESTAMP): cv.positive_float,
+        vol.Optional(CONF_MINTEMP): CV_WX_DATA_VALID_TEMP_RANGE,
+        vol.Optional(CONF_MAXTEMP): CV_WX_DATA_VALID_TEMP_RANGE,
+        vol.Optional(CONF_TEMPERATURE): CV_WX_DATA_VALID_TEMP_RANGE,
+        vol.Optional(CONF_WIND): CV_WX_DATA_VALID_WIND_SPEED,
+        vol.Optional(CONF_SOLARRAD): CV_WX_DATA_VALID_SOLARRAD,
+        vol.Optional(CONF_QPF): CV_WX_DATA_VALID_RAIN_RANGE,
+        vol.Optional(CONF_RAIN): CV_WX_DATA_VALID_RAIN_RANGE,
+        vol.Optional(CONF_ET): CV_WX_DATA_VALID_RAIN_RANGE,
+        vol.Optional(CONF_MINRH): CV_WX_DATA_VALID_PERCENTAGE,
+        vol.Optional(CONF_MAXRH): CV_WX_DATA_VALID_PERCENTAGE,
+        vol.Optional(CONF_CONDITION): cv.string,
+        vol.Optional(CONF_PRESSURE): CV_WX_DATA_VALID_PRESSURE,
+        vol.Optional(CONF_DEWPOINT): CV_WX_DATA_VALID_TEMP_RANGE,
+    }
 )
 
+SERVICE_RESTRICT_WATERING_SCHEMA = SERVICE_SCHEMA.extend(
+    {
+        vol.Required(CONF_DURATION): cv.time_period,
+    }
+)
 
-async def async_setup(hass, config):
-    """Set up the RainMachine component."""
-    hass.data[DOMAIN] = {}
-    hass.data[DOMAIN][DATA_CLIENT] = {}
-
-    if DOMAIN not in config:
-        return True
-
-    conf = config[DOMAIN]
-
-    for controller in conf[CONF_CONTROLLERS]:
-        hass.async_create_task(
-            hass.config_entries.flow.async_init(
-                DOMAIN, context={"source": SOURCE_IMPORT}, data=controller
-            )
-        )
-
-    return True
+COORDINATOR_UPDATE_INTERVAL_MAP = {
+    DATA_API_VERSIONS: timedelta(minutes=1),
+    DATA_MACHINE_FIRMWARE_UPDATE_STATUS: timedelta(seconds=15),
+    DATA_PROGRAMS: timedelta(seconds=30),
+    DATA_PROVISION_SETTINGS: timedelta(minutes=1),
+    DATA_RESTRICTIONS_CURRENT: timedelta(minutes=1),
+    DATA_RESTRICTIONS_UNIVERSAL: timedelta(minutes=1),
+    DATA_ZONES: timedelta(seconds=15),
+}
 
 
-async def async_setup_entry(hass, config_entry):
+type RainMachineConfigEntry = ConfigEntry[RainMachineData]
+
+
+@dataclass
+class RainMachineData:
+    """Define an object to be stored in `entry.runtime_data`."""
+
+    controller: Controller
+    coordinators: dict[str, RainMachineDataUpdateCoordinator]
+
+
+@callback
+def async_get_entry_for_service_call(
+    hass: HomeAssistant, call: ServiceCall
+) -> RainMachineConfigEntry:
+    """Get the controller related to a service call (by device ID)."""
+    device_id = call.data[CONF_DEVICE_ID]
+    device_registry = dr.async_get(hass)
+
+    if (device_entry := device_registry.async_get(device_id)) is None:
+        raise ValueError(f"Invalid RainMachine device ID: {device_id}")
+
+    for entry_id in device_entry.config_entries:
+        if (entry := hass.config_entries.async_get_entry(entry_id)) is None:
+            continue
+        if entry.domain == DOMAIN:
+            return cast(RainMachineConfigEntry, entry)
+
+    raise ValueError(f"No controller for device ID: {device_id}")
+
+
+async def async_update_programs_and_zones(
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> None:
+    """Update program and zone DataUpdateCoordinators.
+
+    Program and zone updates always go together because of how linked they are:
+    programs affect zones and certain combinations of zones affect programs.
+    """
+    data = entry.runtime_data
+    # No gather here to allow http keep-alive to reuse
+    # the connection for each coordinator.
+    await data.coordinators[DATA_PROGRAMS].async_refresh()
+    await data.coordinators[DATA_ZONES].async_refresh()
+
+
+async def async_setup_entry(  # noqa: C901
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> bool:
     """Set up RainMachine as config entry."""
-    if not config_entry.unique_id:
-        hass.config_entries.async_update_entry(
-            config_entry, unique_id=config_entry.data[CONF_IP_ADDRESS]
-        )
-
-    _verify_domain_control = verify_domain_control(hass, DOMAIN)
-
     websession = aiohttp_client.async_get_clientsession(hass)
-    client = Client(websession)
+    client = Client(session=websession)
+    ip_address = entry.data[CONF_IP_ADDRESS]
 
     try:
         await client.load_local(
-            config_entry.data[CONF_IP_ADDRESS],
-            config_entry.data[CONF_PASSWORD],
-            port=config_entry.data[CONF_PORT],
-            ssl=config_entry.data.get(CONF_SSL, DEFAULT_SSL),
+            ip_address,
+            entry.data[CONF_PASSWORD],
+            port=entry.data[CONF_PORT],
+            use_ssl=entry.data.get(CONF_SSL, DEFAULT_SSL),
         )
     except RainMachineError as err:
-        _LOGGER.error("An error occurred: %s", err)
-        raise ConfigEntryNotReady
-    else:
-        # regenmaschine can load multiple controllers at once, but we only grab the one
-        # we loaded above:
-        controller = next(iter(client.controllers.values()))
+        raise ConfigEntryNotReady from err
 
-        rainmachine = RainMachine(
-            hass,
-            controller,
-            config_entry.data.get(CONF_ZONE_RUN_TIME, DEFAULT_ZONE_RUN),
-            config_entry.data.get(
-                CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds()
-            ),
-        )
+    # regenmaschine can load multiple controllers at once, but we only grab the one
+    # we loaded above:
+    controller = get_client_controller(client)
 
-    # Update the data object, which at this point (prior to any sensors registering
-    # "interest" in the API), will focus on grabbing the latest program and zone data:
-    await rainmachine.async_update()
-    hass.data[DOMAIN][DATA_CLIENT][config_entry.entry_id] = rainmachine
+    entry_updates: dict[str, Any] = {}
+    if not entry.unique_id or is_ip_address(entry.unique_id):
+        # If the config entry doesn't already have a unique ID, set one:
+        entry_updates["unique_id"] = controller.mac
 
-    for component in ("binary_sensor", "sensor", "switch"):
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(config_entry, component)
-        )
-
-    @_verify_domain_control
-    async def disable_program(call):
-        """Disable a program."""
-        await rainmachine.controller.programs.disable(call.data[CONF_PROGRAM_ID])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def disable_zone(call):
-        """Disable a zone."""
-        await rainmachine.controller.zones.disable(call.data[CONF_ZONE_ID])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def enable_program(call):
-        """Enable a program."""
-        await rainmachine.controller.programs.enable(call.data[CONF_PROGRAM_ID])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def enable_zone(call):
-        """Enable a zone."""
-        await rainmachine.controller.zones.enable(call.data[CONF_ZONE_ID])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def pause_watering(call):
-        """Pause watering for a set number of seconds."""
-        await rainmachine.controller.watering.pause_all(call.data[CONF_SECONDS])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def start_program(call):
-        """Start a particular program."""
-        await rainmachine.controller.programs.start(call.data[CONF_PROGRAM_ID])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def start_zone(call):
-        """Start a particular zone for a certain amount of time."""
-        await rainmachine.controller.zones.start(
-            call.data[CONF_ZONE_ID], call.data[CONF_ZONE_RUN_TIME]
-        )
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def stop_all(call):
-        """Stop all watering."""
-        await rainmachine.controller.watering.stop_all()
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def stop_program(call):
-        """Stop a program."""
-        await rainmachine.controller.programs.stop(call.data[CONF_PROGRAM_ID])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def stop_zone(call):
-        """Stop a zone."""
-        await rainmachine.controller.zones.stop(call.data[CONF_ZONE_ID])
-        await rainmachine.async_update_programs_and_zones()
-
-    @_verify_domain_control
-    async def unpause_watering(call):
-        """Unpause watering."""
-        await rainmachine.controller.watering.unpause_all()
-        await rainmachine.async_update_programs_and_zones()
-
-    for service, method, schema in [
-        ("disable_program", disable_program, SERVICE_ALTER_PROGRAM),
-        ("disable_zone", disable_zone, SERVICE_ALTER_ZONE),
-        ("enable_program", enable_program, SERVICE_ALTER_PROGRAM),
-        ("enable_zone", enable_zone, SERVICE_ALTER_ZONE),
-        ("pause_watering", pause_watering, SERVICE_PAUSE_WATERING),
-        ("start_program", start_program, SERVICE_START_PROGRAM_SCHEMA),
-        ("start_zone", start_zone, SERVICE_START_ZONE_SCHEMA),
-        ("stop_all", stop_all, {}),
-        ("stop_program", stop_program, SERVICE_STOP_PROGRAM_SCHEMA),
-        ("stop_zone", stop_zone, SERVICE_STOP_ZONE_SCHEMA),
-        ("unpause_watering", unpause_watering, {}),
-    ]:
-        hass.services.async_register(DOMAIN, service, method, schema=schema)
-
-    return True
-
-
-async def async_unload_entry(hass, config_entry):
-    """Unload an OpenUV config entry."""
-    hass.data[DOMAIN][DATA_CLIENT].pop(config_entry.entry_id)
-
-    tasks = [
-        hass.config_entries.async_forward_entry_unload(config_entry, component)
-        for component in ("binary_sensor", "sensor", "switch")
-    ]
-
-    await asyncio.gather(*tasks)
-
-    return True
-
-
-class RainMachine:
-    """Define a generic RainMachine object."""
-
-    def __init__(self, hass, controller, default_zone_runtime, scan_interval):
-        """Initialize."""
-        self._async_cancel_time_interval_listener = None
-        self._scan_interval_seconds = scan_interval
-        self.controller = controller
-        self.data = {}
-        self.default_zone_runtime = default_zone_runtime
-        self.device_mac = controller.mac
-        self.hass = hass
-
-        self._api_category_count = {
-            DATA_PROVISION_SETTINGS: 0,
-            DATA_RESTRICTIONS_CURRENT: 0,
-            DATA_RESTRICTIONS_UNIVERSAL: 0,
+    if CONF_DEFAULT_ZONE_RUN_TIME in entry.data:
+        # If a zone run time exists in the config entry's data, pop it and move it to
+        # options:
+        data = {**entry.data}
+        entry_updates["data"] = data
+        entry_updates["options"] = {
+            **entry.options,
+            CONF_DEFAULT_ZONE_RUN_TIME: data.pop(CONF_DEFAULT_ZONE_RUN_TIME),
         }
-        self._api_category_locks = {
-            DATA_PROVISION_SETTINGS: asyncio.Lock(),
-            DATA_RESTRICTIONS_CURRENT: asyncio.Lock(),
-            DATA_RESTRICTIONS_UNIVERSAL: asyncio.Lock(),
-        }
+    entry_updates["options"] = {**entry.options}
+    if CONF_USE_APP_RUN_TIMES not in entry.options:
+        entry_updates["options"][CONF_USE_APP_RUN_TIMES] = False
+    if CONF_DEFAULT_ZONE_RUN_TIME not in entry.options:
+        entry_updates["options"][CONF_DEFAULT_ZONE_RUN_TIME] = DEFAULT_ZONE_RUN
+    if CONF_ALLOW_INACTIVE_ZONES_TO_RUN not in entry.options:
+        entry_updates["options"][CONF_ALLOW_INACTIVE_ZONES_TO_RUN] = False
+    if entry_updates:
+        hass.config_entries.async_update_entry(entry, **entry_updates)
 
-    async def _async_update_listener_action(self, now):
-        """Define an async_track_time_interval action to update data."""
-        await self.async_update()
+    if entry.unique_id and controller.mac != entry.unique_id:
+        # If the mac address of the device does not match the unique_id
+        # of the config entry, it likely means the DHCP lease has expired
+        # and the device has been assigned a new IP address. We need to
+        # wait for the next discovery to find the device at its new address
+        # and update the config entry so we do not mix up devices.
+        raise ConfigEntryNotReady(
+            f"Unexpected device found at {ip_address}; expected {entry.unique_id}, "
+            f"found {controller.mac}"
+        )
 
-    @callback
-    def async_deregister_sensor_api_interest(self, api_category):
-        """Decrement the number of entities with data needs from an API category."""
-        # If this deregistration should leave us with no registration at all, remove the
-        # time interval:
-        if sum(self._api_category_count.values()) == 0:
-            if self._async_cancel_time_interval_listener:
-                self._async_cancel_time_interval_listener()
-                self._async_cancel_time_interval_listener = None
-            return
+    async def async_update(api_category: str) -> dict:
+        """Update the appropriate API data based on a category."""
+        data: dict = {}
 
-        self._api_category_count[api_category] -= 1
-
-    async def async_fetch_from_api(self, api_category):
-        """Execute the appropriate coroutine to fetch particular data from the API."""
-        if api_category == DATA_PROGRAMS:
-            data = await self.controller.programs.all(include_inactive=True)
-        elif api_category == DATA_PROVISION_SETTINGS:
-            data = await self.controller.provisioning.settings()
-        elif api_category == DATA_RESTRICTIONS_CURRENT:
-            data = await self.controller.restrictions.current()
-        elif api_category == DATA_RESTRICTIONS_UNIVERSAL:
-            data = await self.controller.restrictions.universal()
-        elif api_category == DATA_ZONES:
-            data = await self.controller.zones.all(include_inactive=True)
-        elif api_category == DATA_ZONES_DETAILS:
-            # This API call needs to be separate from the DATA_ZONES one above because,
-            # maddeningly, the DATA_ZONES_DETAILS API call doesn't include the current
-            # state of the zone:
-            data = await self.controller.zones.all(details=True, include_inactive=True)
-
-        self.data[api_category] = data
-
-    async def async_register_sensor_api_interest(self, api_category):
-        """Increment the number of entities with data needs from an API category."""
-        # If this is the first registration we have, start a time interval:
-        if not self._async_cancel_time_interval_listener:
-            self._async_cancel_time_interval_listener = async_track_time_interval(
-                self.hass,
-                self._async_update_listener_action,
-                timedelta(seconds=self._scan_interval_seconds),
+        try:
+            if api_category == DATA_API_VERSIONS:
+                data = await controller.api.versions()
+            elif api_category == DATA_MACHINE_FIRMWARE_UPDATE_STATUS:
+                data = await controller.machine.get_firmware_update_status()
+            elif api_category == DATA_PROGRAMS:
+                data = await controller.programs.all(include_inactive=True)
+            elif api_category == DATA_PROVISION_SETTINGS:
+                data = await controller.provisioning.settings()
+            elif api_category == DATA_RESTRICTIONS_CURRENT:
+                data = await controller.restrictions.current()
+            elif api_category == DATA_RESTRICTIONS_UNIVERSAL:
+                data = await controller.restrictions.universal()
+            else:
+                data = await controller.zones.all(details=True, include_inactive=True)
+        except UnknownAPICallError:
+            LOGGER.warning(
+                "Skipping unsupported API call for controller %s: %s",
+                controller.name,
+                api_category,
             )
+        except RainMachineError as err:
+            raise UpdateFailed(err) from err
 
-        self._api_category_count[api_category] += 1
+        return data
 
-        # If a sensor registers interest in a particular API call and the data doesn't
-        # exist for it yet, make the API call and grab the data:
-        async with self._api_category_locks[api_category]:
-            if api_category not in self.data:
-                await self.async_fetch_from_api(api_category)
+    coordinators = {}
+    for api_category, update_interval in COORDINATOR_UPDATE_INTERVAL_MAP.items():
+        coordinator = coordinators[api_category] = RainMachineDataUpdateCoordinator(
+            hass,
+            entry=entry,
+            name=f'{controller.name} ("{api_category}")',
+            api_category=api_category,
+            update_interval=update_interval,
+            update_method=partial(async_update, api_category),
+        )
+        coordinator.async_initialize()
+        # Its generally faster not to gather here so we can
+        # reuse the connection instead of creating a new
+        # connection for each coordinator.
+        await coordinator.async_config_entry_first_refresh()
 
-    async def async_update(self):
-        """Update all RainMachine data."""
-        tasks = [self.async_update_programs_and_zones(), self.async_update_sensors()]
-        await asyncio.gather(*tasks)
+    entry.runtime_data = RainMachineData(
+        controller=controller, coordinators=coordinators
+    )
 
-    async def async_update_sensors(self):
-        """Update sensor/binary sensor data."""
-        _LOGGER.debug("Updating sensor data for RainMachine")
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-        # Fetch an API category if there is at least one interested entity:
-        tasks = {}
-        for category, count in self._api_category_count.items():
-            if count == 0:
-                continue
-            tasks[category] = self.async_fetch_from_api(category)
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for api_category, result in zip(tasks, results):
-            if isinstance(result, RainMachineError):
-                _LOGGER.error(
-                    "There was an error while updating %s: %s", api_category, result
-                )
-                continue
+    def call_with_controller(
+        update_programs_and_zones: bool = True,
+    ) -> Callable[
+        [Callable[[ServiceCall, Controller], Coroutine[Any, Any, None]]],
+        Callable[[ServiceCall], Coroutine[Any, Any, None]],
+    ]:
+        """Hydrate a service call with the appropriate controller."""
 
-        async_dispatcher_send(self.hass, SENSOR_UPDATE_TOPIC)
+        def decorator(
+            func: Callable[[ServiceCall, Controller], Coroutine[Any, Any, None]],
+        ) -> Callable[[ServiceCall], Coroutine[Any, Any, None]]:
+            """Define the decorator."""
 
-    async def async_update_programs_and_zones(self):
-        """Update program and zone data.
+            @wraps(func)
+            async def wrapper(call: ServiceCall) -> None:
+                """Wrap the service function."""
+                entry = async_get_entry_for_service_call(hass, call)
+                data = entry.runtime_data
 
-        Program and zone updates always go together because of how linked they are:
-        programs affect zones and certain combinations of zones affect programs.
+                try:
+                    await func(call, data.controller)
+                except RainMachineError as err:
+                    raise HomeAssistantError(
+                        f"Error while executing {func.__name__}: {err}"
+                    ) from err
 
-        Note that this call does not take into account interested entities when making
-        the API calls; we make the reasonable assumption that switches will always be
-        enabled.
-        """
-        _LOGGER.debug("Updating program and zone data for RainMachine")
+                if update_programs_and_zones:
+                    await async_update_programs_and_zones(hass, entry)
 
-        tasks = {
-            DATA_PROGRAMS: self.async_fetch_from_api(DATA_PROGRAMS),
-            DATA_ZONES: self.async_fetch_from_api(DATA_ZONES),
-            DATA_ZONES_DETAILS: self.async_fetch_from_api(DATA_ZONES_DETAILS),
-        }
+            return wrapper
 
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for api_category, result in zip(tasks, results):
-            if isinstance(result, RainMachineError):
-                _LOGGER.error(
-                    "There was an error while updating %s: %s", api_category, result
-                )
+        return decorator
 
-        async_dispatcher_send(self.hass, PROGRAM_UPDATE_TOPIC)
-        async_dispatcher_send(self.hass, ZONE_UPDATE_TOPIC)
+    @call_with_controller()
+    async def async_pause_watering(call: ServiceCall, controller: Controller) -> None:
+        """Pause watering for a set number of seconds."""
+        await controller.watering.pause_all(call.data[CONF_SECONDS])
+
+    @call_with_controller(update_programs_and_zones=False)
+    async def async_push_flow_meter_data(
+        call: ServiceCall, controller: Controller
+    ) -> None:
+        """Push flow meter data to the device."""
+        value = call.data[CONF_VALUE]
+        if units := call.data.get(CONF_UNIT_OF_MEASUREMENT):
+            await controller.watering.post_flowmeter(value=value, units=units)
+        else:
+            await controller.watering.post_flowmeter(value=value)
+
+    @call_with_controller(update_programs_and_zones=False)
+    async def async_push_weather_data(
+        call: ServiceCall, controller: Controller
+    ) -> None:
+        """Push weather data to the device."""
+        await controller.parsers.post_data(
+            {
+                CONF_WEATHER: [
+                    {
+                        key: value
+                        for key, value in call.data.items()
+                        if key != CONF_DEVICE_ID
+                    }
+                ]
+            }
+        )
+
+    @call_with_controller()
+    async def async_restrict_watering(
+        call: ServiceCall, controller: Controller
+    ) -> None:
+        """Restrict watering for a time period."""
+        duration = call.data[CONF_DURATION]
+        await controller.restrictions.set_universal(
+            {
+                "rainDelayStartTime": round(as_timestamp(utcnow())),
+                "rainDelayDuration": duration.total_seconds(),
+            },
+        )
+
+    @call_with_controller()
+    async def async_stop_all(call: ServiceCall, controller: Controller) -> None:
+        """Stop all watering."""
+        await controller.watering.stop_all()
+
+    @call_with_controller()
+    async def async_unpause_watering(call: ServiceCall, controller: Controller) -> None:
+        """Unpause watering."""
+        await controller.watering.unpause_all()
+
+    @call_with_controller()
+    async def async_unrestrict_watering(
+        call: ServiceCall, controller: Controller
+    ) -> None:
+        """Unrestrict watering."""
+        await controller.restrictions.set_universal(
+            {
+                "rainDelayStartTime": round(as_timestamp(utcnow())),
+                "rainDelayDuration": 0,
+            },
+        )
+
+    for service_name, schema, method in (
+        (
+            SERVICE_NAME_PAUSE_WATERING,
+            SERVICE_PAUSE_WATERING_SCHEMA,
+            async_pause_watering,
+        ),
+        (
+            SERVICE_NAME_PUSH_FLOW_METER_DATA,
+            SERVICE_PUSH_FLOW_METER_DATA_SCHEMA,
+            async_push_flow_meter_data,
+        ),
+        (
+            SERVICE_NAME_PUSH_WEATHER_DATA,
+            SERVICE_PUSH_WEATHER_DATA_SCHEMA,
+            async_push_weather_data,
+        ),
+        (
+            SERVICE_NAME_RESTRICT_WATERING,
+            SERVICE_RESTRICT_WATERING_SCHEMA,
+            async_restrict_watering,
+        ),
+        (SERVICE_NAME_STOP_ALL, SERVICE_SCHEMA, async_stop_all),
+        (SERVICE_NAME_UNPAUSE_WATERING, SERVICE_SCHEMA, async_unpause_watering),
+        (
+            SERVICE_NAME_UNRESTRICT_WATERING,
+            SERVICE_SCHEMA,
+            async_unrestrict_watering,
+        ),
+    ):
+        if hass.services.has_service(DOMAIN, service_name):
+            continue
+        hass.services.async_register(DOMAIN, service_name, method, schema=schema)
+
+    return True
 
 
-class RainMachineEntity(Entity):
-    """Define a generic RainMachine entity."""
+async def async_unload_entry(
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> bool:
+    """Unload an RainMachine config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    loaded_entries = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state is ConfigEntryState.LOADED
+    ]
+    if len(loaded_entries) == 1:
+        # If this is the last loaded instance of RainMachine, deregister any services
+        # defined during integration setup:
+        for service_name in (
+            SERVICE_NAME_PAUSE_WATERING,
+            SERVICE_NAME_PUSH_FLOW_METER_DATA,
+            SERVICE_NAME_PUSH_WEATHER_DATA,
+            SERVICE_NAME_RESTRICT_WATERING,
+            SERVICE_NAME_STOP_ALL,
+            SERVICE_NAME_UNPAUSE_WATERING,
+            SERVICE_NAME_UNRESTRICT_WATERING,
+        ):
+            hass.services.async_remove(DOMAIN, service_name)
 
-    def __init__(self, rainmachine):
-        """Initialize."""
-        self._attrs = {ATTR_ATTRIBUTION: DEFAULT_ATTRIBUTION}
-        self._device_class = None
-        self._name = None
-        self.rainmachine = rainmachine
+    return unload_ok
 
-    @property
-    def device_class(self):
-        """Return the device class."""
-        return self._device_class
 
-    @property
-    def device_info(self):
-        """Return device registry information for this entity."""
-        return {
-            "identifiers": {(DOMAIN, self.rainmachine.controller.mac)},
-            "name": self.rainmachine.controller.name,
-            "manufacturer": "RainMachine",
-            "model": (
-                f"Version {self.rainmachine.controller.hardware_version} "
-                f"(API: {self.rainmachine.controller.api_version})"
-            ),
-            "sw_version": self.rainmachine.controller.software_version,
-        }
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> bool:
+    """Migrate an old config entry."""
+    version = entry.version
 
-    @property
-    def device_state_attributes(self) -> dict:
-        """Return the state attributes."""
-        return self._attrs
+    LOGGER.debug("Migrating from version %s", version)
 
-    @property
-    def name(self) -> str:
-        """Return the name of the entity."""
-        return self._name
+    # 1 -> 2: Update unique IDs to be consistent across platform (including removing
+    # the silly removal of colons in the MAC address that was added originally):
+    if version == 1:
+        version = 2
+        hass.config_entries.async_update_entry(entry, version=version)
 
-    @property
-    def should_poll(self):
-        """Disable polling."""
-        return False
+        @callback
+        def migrate_unique_id(entity_entry: er.RegistryEntry) -> dict[str, Any]:
+            """Migrate the unique ID to a new format."""
+            unique_id_pieces = entity_entry.unique_id.split("_")
+            old_mac = unique_id_pieces[0]
+            new_mac = ":".join(old_mac[i : i + 2] for i in range(0, len(old_mac), 2))
+            unique_id_pieces[0] = new_mac
 
-    @callback
-    def _update_state(self):
-        """Update the state."""
-        self.update_from_latest_data()
-        self.async_write_ha_state()
+            if entity_entry.entity_id.startswith("switch"):
+                unique_id_pieces[1] = unique_id_pieces[1][11:].lower()
 
-    @callback
-    def update_from_latest_data(self):
-        """Update the entity."""
-        raise NotImplementedError
+            return {"new_unique_id": "_".join(unique_id_pieces)}
+
+        await er.async_migrate_entries(hass, entry.entry_id, migrate_unique_id)
+
+    LOGGER.debug("Migration to version %s successful", version)
+
+    return True
+
+
+async def async_reload_entry(
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> None:
+    """Handle an options update."""
+    await hass.config_entries.async_reload(entry.entry_id)

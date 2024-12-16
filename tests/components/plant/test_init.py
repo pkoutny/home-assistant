@@ -1,22 +1,21 @@
 """Unit tests for platform/plant.py."""
+
 from datetime import datetime, timedelta
 
-import pytest
-
-from homeassistant.components import recorder
-import homeassistant.components.plant as plant
+from homeassistant.components import plant
+from homeassistant.components.recorder import Recorder
 from homeassistant.const import (
     ATTR_UNIT_OF_MEASUREMENT,
-    CONDUCTIVITY,
+    LIGHT_LUX,
     STATE_OK,
     STATE_PROBLEM,
     STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
+    UnitOfConductivity,
 )
-from homeassistant.core import State
+from homeassistant.core import HomeAssistant, State
 from homeassistant.setup import async_setup_component
 
-from tests.common import init_recorder_component
+from tests.components.recorder.common import async_wait_recording_done
 
 GOOD_DATA = {
     "moisture": 50,
@@ -46,7 +45,7 @@ GOOD_CONFIG = {
 }
 
 
-async def test_valid_data(hass):
+async def test_valid_data(hass: HomeAssistant) -> None:
     """Test processing valid data."""
     sensor = plant.Plant("my plant", GOOD_CONFIG)
     sensor.entity_id = "sensor.mqtt_plant_battery"
@@ -54,45 +53,45 @@ async def test_valid_data(hass):
     for reading, value in GOOD_DATA.items():
         sensor.state_changed(
             GOOD_CONFIG["sensors"][reading],
-            None,
             State(GOOD_CONFIG["sensors"][reading], value),
         )
     assert sensor.state == "ok"
-    attrib = sensor.state_attributes
+    attrib = sensor.extra_state_attributes
     for reading, value in GOOD_DATA.items():
         # battery level has a different name in
         # the JSON format than in hass
         assert attrib[reading] == value
 
 
-async def test_low_battery(hass):
+async def test_low_battery(hass: HomeAssistant) -> None:
     """Test processing with low battery data and limit set."""
     sensor = plant.Plant("other plant", GOOD_CONFIG)
     sensor.entity_id = "sensor.mqtt_plant_battery"
     sensor.hass = hass
-    assert sensor.state_attributes["problem"] == "none"
+    assert sensor.extra_state_attributes["problem"] == "none"
     sensor.state_changed(
         "sensor.mqtt_plant_battery",
-        State("sensor.mqtt_plant_battery", 45),
         State("sensor.mqtt_plant_battery", 10),
     )
     assert sensor.state == "problem"
-    assert sensor.state_attributes["problem"] == "battery low"
+    assert sensor.extra_state_attributes["problem"] == "battery low"
 
 
-async def test_initial_states(hass):
+async def test_initial_states(hass: HomeAssistant) -> None:
     """Test plant initialises attributes if sensor already exists."""
-    hass.states.async_set(MOISTURE_ENTITY, 5, {ATTR_UNIT_OF_MEASUREMENT: CONDUCTIVITY})
+    hass.states.async_set(
+        MOISTURE_ENTITY, 5, {ATTR_UNIT_OF_MEASUREMENT: UnitOfConductivity.MICROSIEMENS}
+    )
     plant_name = "some_plant"
     assert await async_setup_component(
         hass, plant.DOMAIN, {plant.DOMAIN: {plant_name: GOOD_CONFIG}}
     )
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
-    assert 5 == state.attributes[plant.READING_MOISTURE]
+    assert state.attributes[plant.READING_MOISTURE] == 5
 
 
-async def test_update_states(hass):
+async def test_update_states(hass: HomeAssistant) -> None:
     """Test updating the state of a sensor.
 
     Make sure that plant processes this correctly.
@@ -101,14 +100,16 @@ async def test_update_states(hass):
     assert await async_setup_component(
         hass, plant.DOMAIN, {plant.DOMAIN: {plant_name: GOOD_CONFIG}}
     )
-    hass.states.async_set(MOISTURE_ENTITY, 5, {ATTR_UNIT_OF_MEASUREMENT: CONDUCTIVITY})
+    hass.states.async_set(
+        MOISTURE_ENTITY, 5, {ATTR_UNIT_OF_MEASUREMENT: UnitOfConductivity.MICROSIEMENS}
+    )
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
-    assert STATE_PROBLEM == state.state
-    assert 5 == state.attributes[plant.READING_MOISTURE]
+    assert state.state == STATE_PROBLEM
+    assert state.attributes[plant.READING_MOISTURE] == 5
 
 
-async def test_unavailable_state(hass):
+async def test_unavailable_state(hass: HomeAssistant) -> None:
     """Test updating the state with unavailable.
 
     Make sure that plant processes this correctly.
@@ -118,7 +119,9 @@ async def test_unavailable_state(hass):
         hass, plant.DOMAIN, {plant.DOMAIN: {plant_name: GOOD_CONFIG}}
     )
     hass.states.async_set(
-        MOISTURE_ENTITY, STATE_UNAVAILABLE, {ATTR_UNIT_OF_MEASUREMENT: CONDUCTIVITY}
+        MOISTURE_ENTITY,
+        STATE_UNAVAILABLE,
+        {ATTR_UNIT_OF_MEASUREMENT: UnitOfConductivity.MICROSIEMENS},
     )
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
@@ -126,7 +129,7 @@ async def test_unavailable_state(hass):
     assert state.attributes[plant.READING_MOISTURE] == STATE_UNAVAILABLE
 
 
-async def test_state_problem_if_unavailable(hass):
+async def test_state_problem_if_unavailable(hass: HomeAssistant) -> None:
     """Test updating the state with unavailable after setting it to valid value.
 
     Make sure that plant processes this correctly.
@@ -135,13 +138,17 @@ async def test_state_problem_if_unavailable(hass):
     assert await async_setup_component(
         hass, plant.DOMAIN, {plant.DOMAIN: {plant_name: GOOD_CONFIG}}
     )
-    hass.states.async_set(MOISTURE_ENTITY, 42, {ATTR_UNIT_OF_MEASUREMENT: CONDUCTIVITY})
+    hass.states.async_set(
+        MOISTURE_ENTITY, 42, {ATTR_UNIT_OF_MEASUREMENT: UnitOfConductivity.MICROSIEMENS}
+    )
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
     assert state.state == STATE_OK
     assert state.attributes[plant.READING_MOISTURE] == 42
     hass.states.async_set(
-        MOISTURE_ENTITY, STATE_UNAVAILABLE, {ATTR_UNIT_OF_MEASUREMENT: CONDUCTIVITY}
+        MOISTURE_ENTITY,
+        STATE_UNAVAILABLE,
+        {ATTR_UNIT_OF_MEASUREMENT: UnitOfConductivity.MICROSIEMENS},
     )
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
@@ -149,28 +156,20 @@ async def test_state_problem_if_unavailable(hass):
     assert state.attributes[plant.READING_MOISTURE] == STATE_UNAVAILABLE
 
 
-@pytest.mark.skipif(
-    plant.ENABLE_LOAD_HISTORY is False,
-    reason="tests for loading from DB are unstable, thus"
-    "this feature is turned of until tests become"
-    "stable",
-)
-async def test_load_from_db(hass):
+async def test_load_from_db(recorder_mock: Recorder, hass: HomeAssistant) -> None:
     """Test bootstrapping the brightness history from the database.
 
     This test can should only be executed if the loading of the history
     is enabled via plant.ENABLE_LOAD_HISTORY.
     """
-    init_recorder_component(hass)
     plant_name = "wise_plant"
-    for value in [20, 30, 10]:
-
+    for value in (20, 30, 10):
         hass.states.async_set(
             BRIGHTNESS_ENTITY, value, {ATTR_UNIT_OF_MEASUREMENT: "Lux"}
         )
         await hass.async_block_till_done()
     # wait for the recorder to really store the data
-    hass.data[recorder.DATA_INSTANCE].block_till_done()
+    await async_wait_recording_done(hass)
 
     assert await async_setup_component(
         hass, plant.DOMAIN, {plant.DOMAIN: {plant_name: GOOD_CONFIG}}
@@ -178,51 +177,51 @@ async def test_load_from_db(hass):
     await hass.async_block_till_done()
 
     state = hass.states.get(f"plant.{plant_name}")
-    assert STATE_UNKNOWN == state.state
+    assert state.state == STATE_PROBLEM
     max_brightness = state.attributes.get(plant.ATTR_MAX_BRIGHTNESS_HISTORY)
-    assert 30 == max_brightness
+    assert max_brightness == 30
 
 
-async def test_brightness_history(hass):
+async def test_brightness_history(hass: HomeAssistant) -> None:
     """Test the min_brightness check."""
     plant_name = "some_plant"
     assert await async_setup_component(
         hass, plant.DOMAIN, {plant.DOMAIN: {plant_name: GOOD_CONFIG}}
     )
-    hass.states.async_set(BRIGHTNESS_ENTITY, 100, {ATTR_UNIT_OF_MEASUREMENT: "lux"})
+    hass.states.async_set(BRIGHTNESS_ENTITY, 100, {ATTR_UNIT_OF_MEASUREMENT: LIGHT_LUX})
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
-    assert STATE_PROBLEM == state.state
+    assert state.state == STATE_PROBLEM
 
-    hass.states.async_set(BRIGHTNESS_ENTITY, 600, {ATTR_UNIT_OF_MEASUREMENT: "lux"})
+    hass.states.async_set(BRIGHTNESS_ENTITY, 600, {ATTR_UNIT_OF_MEASUREMENT: LIGHT_LUX})
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
-    assert STATE_OK == state.state
+    assert state.state == STATE_OK
 
-    hass.states.async_set(BRIGHTNESS_ENTITY, 100, {ATTR_UNIT_OF_MEASUREMENT: "lux"})
+    hass.states.async_set(BRIGHTNESS_ENTITY, 100, {ATTR_UNIT_OF_MEASUREMENT: LIGHT_LUX})
     await hass.async_block_till_done()
     state = hass.states.get(f"plant.{plant_name}")
-    assert STATE_OK == state.state
+    assert state.state == STATE_OK
 
 
-def test_daily_history_no_data(hass):
+def test_daily_history_no_data(hass: HomeAssistant) -> None:
     """Test with empty history."""
     dh = plant.DailyHistory(3)
     assert dh.max is None
 
 
-def test_daily_history_one_day(hass):
+def test_daily_history_one_day(hass: HomeAssistant) -> None:
     """Test storing data for the same day."""
     dh = plant.DailyHistory(3)
     values = [-2, 10, 0, 5, 20]
-    for i in range(len(values)):
-        dh.add_measurement(values[i])
+    for i, value in enumerate(values):
+        dh.add_measurement(value)
         max_value = max(values[0 : i + 1])
-        assert 1 == len(dh._days)
+        assert len(dh._days) == 1
         assert dh.max == max_value
 
 
-def test_daily_history_multiple_days(hass):
+def test_daily_history_multiple_days(hass: HomeAssistant) -> None:
     """Test storing data for different days."""
     dh = plant.DailyHistory(3)
     today = datetime.now()
@@ -233,6 +232,6 @@ def test_daily_history_multiple_days(hass):
     values = [10, 1, 7, 3]
     max_values = [10, 10, 10, 7]
 
-    for i in range(len(days)):
-        dh.add_measurement(values[i], days[i])
+    for i, value in enumerate(days):
+        dh.add_measurement(values[i], value)
         assert max_values[i] == dh.max

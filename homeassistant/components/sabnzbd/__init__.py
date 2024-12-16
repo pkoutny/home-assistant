@@ -1,269 +1,181 @@
 """Support for monitoring an SABnzbd NZB client."""
-from datetime import timedelta
-import logging
 
-from pysabnzbd import SabnzbdApi, SabnzbdApiException
+from __future__ import annotations
+
+from collections.abc import Callable, Coroutine
+import logging
+from typing import Any
+
 import voluptuous as vol
 
-from homeassistant.components.discovery import SERVICE_SABNZBD
-from homeassistant.const import (
-    CONF_API_KEY,
-    CONF_HOST,
-    CONF_NAME,
-    CONF_PATH,
-    CONF_PORT,
-    CONF_SENSORS,
-    CONF_SSL,
-    DATA_GIGABYTES,
-    DATA_MEGABYTES,
-    DATA_RATE_MEGABYTES_PER_SECOND,
-)
-from homeassistant.core import callback
-from homeassistant.helpers import discovery
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.util.json import load_json, save_json
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+import homeassistant.helpers.issue_registry as ir
+from homeassistant.helpers.typing import ConfigType
 
+from .const import (
+    ATTR_API_KEY,
+    ATTR_SPEED,
+    DEFAULT_SPEED_LIMIT,
+    DOMAIN,
+    SERVICE_PAUSE,
+    SERVICE_RESUME,
+    SERVICE_SET_SPEED,
+)
+from .coordinator import SabnzbdConfigEntry, SabnzbdUpdateCoordinator
+from .helpers import get_client
+
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.NUMBER, Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "sabnzbd"
-DATA_SABNZBD = "sabznbd"
-
-_CONFIGURING = {}
-
-ATTR_SPEED = "speed"
-BASE_URL_FORMAT = "{}://{}:{}/"
-CONFIG_FILE = "sabnzbd.conf"
-DEFAULT_HOST = "localhost"
-DEFAULT_NAME = "SABnzbd"
-DEFAULT_PORT = 8080
-DEFAULT_SPEED_LIMIT = "100"
-DEFAULT_SSL = False
-
-UPDATE_INTERVAL = timedelta(seconds=30)
-
-SERVICE_PAUSE = "pause"
-SERVICE_RESUME = "resume"
-SERVICE_SET_SPEED = "set_speed"
-
-SIGNAL_SABNZBD_UPDATED = "sabnzbd_updated"
-
-SENSOR_TYPES = {
-    "current_status": ["Status", None, "status"],
-    "speed": ["Speed", DATA_RATE_MEGABYTES_PER_SECOND, "kbpersec"],
-    "queue_size": ["Queue", DATA_MEGABYTES, "mb"],
-    "queue_remaining": ["Left", DATA_MEGABYTES, "mbleft"],
-    "disk_size": ["Disk", DATA_GIGABYTES, "diskspacetotal1"],
-    "disk_free": ["Disk Free", DATA_GIGABYTES, "diskspace1"],
-    "queue_count": ["Queue Count", None, "noofslots_total"],
-    "day_size": ["Daily Total", DATA_GIGABYTES, "day_size"],
-    "week_size": ["Weekly Total", DATA_GIGABYTES, "week_size"],
-    "month_size": ["Monthly Total", DATA_GIGABYTES, "month_size"],
-    "total_size": ["Total", DATA_GIGABYTES, "total_size"],
-}
-
-SPEED_LIMIT_SCHEMA = vol.Schema(
-    {vol.Optional(ATTR_SPEED, default=DEFAULT_SPEED_LIMIT): cv.string}
+SERVICES = (
+    SERVICE_PAUSE,
+    SERVICE_RESUME,
+    SERVICE_SET_SPEED,
 )
 
-CONFIG_SCHEMA = vol.Schema(
+SERVICE_BASE_SCHEMA = vol.Schema(
     {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_API_KEY): cv.string,
-                vol.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
-                vol.Optional(CONF_PATH): cv.string,
-                vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-                vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-                vol.Optional(CONF_SENSORS): vol.All(
-                    cv.ensure_list, [vol.In(SENSOR_TYPES)]
-                ),
-                vol.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
+        vol.Required(ATTR_API_KEY): cv.string,
+    }
 )
 
+SERVICE_SPEED_SCHEMA = SERVICE_BASE_SCHEMA.extend(
+    {
+        vol.Optional(ATTR_SPEED, default=DEFAULT_SPEED_LIMIT): cv.string,
+    }
+)
 
-async def async_check_sabnzbd(sab_api):
-    """Check if we can reach SABnzbd."""
-
-    try:
-        await sab_api.check_available()
-        return True
-    except SabnzbdApiException:
-        _LOGGER.error("Connection to SABnzbd API failed")
-        return False
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-async def async_configure_sabnzbd(
-    hass, config, use_ssl, name=DEFAULT_NAME, api_key=None
-):
-    """Try to configure Sabnzbd and request api key if configuration fails."""
+@callback
+def async_get_entry_for_service_call(
+    hass: HomeAssistant, call: ServiceCall
+) -> SabnzbdConfigEntry:
+    """Get the entry ID related to a service call (by device ID)."""
+    call_data_api_key = call.data[ATTR_API_KEY]
 
-    host = config[CONF_HOST]
-    port = config[CONF_PORT]
-    web_root = config.get(CONF_PATH)
-    uri_scheme = "https" if use_ssl else "http"
-    base_url = BASE_URL_FORMAT.format(uri_scheme, host, port)
-    if api_key is None:
-        conf = await hass.async_add_job(load_json, hass.config.path(CONFIG_FILE))
-        api_key = conf.get(base_url, {}).get(CONF_API_KEY, "")
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.data[ATTR_API_KEY] == call_data_api_key:
+            return entry
 
-    sab_api = SabnzbdApi(
-        base_url, api_key, web_root=web_root, session=async_get_clientsession(hass)
-    )
-    if await async_check_sabnzbd(sab_api):
-        async_setup_sabnzbd(hass, sab_api, config, name)
-    else:
-        async_request_configuration(hass, config, base_url, web_root)
+    raise ValueError(f"No api for API key: {call_data_api_key}")
 
 
-async def async_setup(hass, config):
-    """Set up the SABnzbd component."""
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the SabNzbd Component."""
 
-    async def sabnzbd_discovered(service, info):
-        """Handle service discovery."""
-        ssl = info.get("properties", {}).get("https", "0") == "1"
-        await async_configure_sabnzbd(hass, info, ssl)
+    @callback
+    def extract_api(
+        func: Callable[
+            [ServiceCall, SabnzbdUpdateCoordinator], Coroutine[Any, Any, None]
+        ],
+    ) -> Callable[[ServiceCall], Coroutine[Any, Any, None]]:
+        """Define a decorator to get the correct api for a service call."""
 
-    discovery.async_listen(hass, SERVICE_SABNZBD, sabnzbd_discovered)
+        async def wrapper(call: ServiceCall) -> None:
+            """Wrap the service function."""
+            config_entry = async_get_entry_for_service_call(hass, call)
+            coordinator = config_entry.runtime_data
 
-    conf = config.get(DOMAIN)
-    if conf is not None:
-        use_ssl = conf[CONF_SSL]
-        name = conf.get(CONF_NAME)
-        api_key = conf.get(CONF_API_KEY)
-        await async_configure_sabnzbd(hass, conf, use_ssl, name, api_key)
+            try:
+                await func(call, coordinator)
+            except Exception as err:
+                raise HomeAssistantError(
+                    f"Error while executing {func.__name__}: {err}"
+                ) from err
+
+        return wrapper
+
+    @extract_api
+    async def async_pause_queue(
+        call: ServiceCall, coordinator: SabnzbdUpdateCoordinator
+    ) -> None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "pause_action_deprecated",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            breaks_in_ha_version="2025.6",
+            translation_key="pause_action_deprecated",
+        )
+        await coordinator.sab_api.pause_queue()
+
+    @extract_api
+    async def async_resume_queue(
+        call: ServiceCall, coordinator: SabnzbdUpdateCoordinator
+    ) -> None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "resume_action_deprecated",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            breaks_in_ha_version="2025.6",
+            translation_key="resume_action_deprecated",
+        )
+        await coordinator.sab_api.resume_queue()
+
+    @extract_api
+    async def async_set_queue_speed(
+        call: ServiceCall, coordinator: SabnzbdUpdateCoordinator
+    ) -> None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "set_speed_action_deprecated",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            breaks_in_ha_version="2025.6",
+            translation_key="set_speed_action_deprecated",
+        )
+        speed = call.data.get(ATTR_SPEED)
+        await coordinator.sab_api.set_speed_limit(speed)
+
+    for service, method, schema in (
+        (SERVICE_PAUSE, async_pause_queue, SERVICE_BASE_SCHEMA),
+        (SERVICE_RESUME, async_resume_queue, SERVICE_BASE_SCHEMA),
+        (SERVICE_SET_SPEED, async_set_queue_speed, SERVICE_SPEED_SCHEMA),
+    ):
+        hass.services.async_register(DOMAIN, service, method, schema=schema)
+
     return True
 
 
-@callback
-def async_setup_sabnzbd(hass, sab_api, config, name):
-    """Set up SABnzbd sensors and services."""
-    sab_api_data = SabnzbdApiData(sab_api, name, config.get(CONF_SENSORS, {}))
+async def async_setup_entry(hass: HomeAssistant, entry: SabnzbdConfigEntry) -> bool:
+    """Set up the SabNzbd Component."""
 
-    if config.get(CONF_SENSORS):
-        hass.data[DATA_SABNZBD] = sab_api_data
-        hass.async_create_task(
-            discovery.async_load_platform(hass, "sensor", DOMAIN, {}, config)
-        )
+    sab_api = await get_client(hass, entry.data)
+    if not sab_api:
+        raise ConfigEntryNotReady
 
-    async def async_service_handler(service):
-        """Handle service calls."""
-        if service.service == SERVICE_PAUSE:
-            await sab_api_data.async_pause_queue()
-        elif service.service == SERVICE_RESUME:
-            await sab_api_data.async_resume_queue()
-        elif service.service == SERVICE_SET_SPEED:
-            speed = service.data.get(ATTR_SPEED)
-            await sab_api_data.async_set_queue_speed(speed)
+    coordinator = SabnzbdUpdateCoordinator(hass, entry, sab_api)
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
 
-    hass.services.async_register(
-        DOMAIN, SERVICE_PAUSE, async_service_handler, schema=vol.Schema({})
-    )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    hass.services.async_register(
-        DOMAIN, SERVICE_RESUME, async_service_handler, schema=vol.Schema({})
-    )
-
-    hass.services.async_register(
-        DOMAIN, SERVICE_SET_SPEED, async_service_handler, schema=SPEED_LIMIT_SCHEMA
-    )
-
-    async def async_update_sabnzbd(now):
-        """Refresh SABnzbd queue data."""
-
-        try:
-            await sab_api.refresh_data()
-            async_dispatcher_send(hass, SIGNAL_SABNZBD_UPDATED, None)
-        except SabnzbdApiException as err:
-            _LOGGER.error(err)
-
-    async_track_time_interval(hass, async_update_sabnzbd, UPDATE_INTERVAL)
+    return True
 
 
-@callback
-def async_request_configuration(hass, config, host, web_root):
-    """Request configuration steps from the user."""
+async def async_unload_entry(hass: HomeAssistant, entry: SabnzbdConfigEntry) -> bool:
+    """Unload a Sabnzbd config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    configurator = hass.components.configurator
-    # We got an error if this method is called while we are configuring
-    if host in _CONFIGURING:
-        configurator.async_notify_errors(
-            _CONFIGURING[host], "Failed to register, please try again."
-        )
+    loaded_entries = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state == ConfigEntryState.LOADED
+    ]
+    if len(loaded_entries) == 1:
+        # If this is the last loaded instance of Sabnzbd, deregister any services
+        # defined during integration setup:
+        for service_name in SERVICES:
+            hass.services.async_remove(DOMAIN, service_name)
 
-        return
-
-    async def async_configuration_callback(data):
-        """Handle configuration changes."""
-        api_key = data.get(CONF_API_KEY)
-        sab_api = SabnzbdApi(
-            host, api_key, web_root=web_root, session=async_get_clientsession(hass)
-        )
-        if not await async_check_sabnzbd(sab_api):
-            return
-
-        def success():
-            """Signal successful setup."""
-            conf = load_json(hass.config.path(CONFIG_FILE))
-            conf[host] = {CONF_API_KEY: api_key}
-            save_json(hass.config.path(CONFIG_FILE), conf)
-            req_config = _CONFIGURING.pop(host)
-            configurator.request_done(req_config)
-
-        hass.async_add_job(success)
-        async_setup_sabnzbd(hass, sab_api, config, config.get(CONF_NAME, DEFAULT_NAME))
-
-    _CONFIGURING[host] = configurator.async_request_config(
-        DEFAULT_NAME,
-        async_configuration_callback,
-        description="Enter the API Key",
-        submit_caption="Confirm",
-        fields=[{"id": CONF_API_KEY, "name": "API Key", "type": ""}],
-    )
-
-
-class SabnzbdApiData:
-    """Class for storing/refreshing sabnzbd api queue data."""
-
-    def __init__(self, sab_api, name, sensors):
-        """Initialize component."""
-        self.sab_api = sab_api
-        self.name = name
-        self.sensors = sensors
-
-    async def async_pause_queue(self):
-        """Pause Sabnzbd queue."""
-
-        try:
-            return await self.sab_api.pause_queue()
-        except SabnzbdApiException as err:
-            _LOGGER.error(err)
-            return False
-
-    async def async_resume_queue(self):
-        """Resume Sabnzbd queue."""
-
-        try:
-            return await self.sab_api.resume_queue()
-        except SabnzbdApiException as err:
-            _LOGGER.error(err)
-            return False
-
-    async def async_set_queue_speed(self, limit):
-        """Set speed limit for the Sabnzbd queue."""
-
-        try:
-            return await self.sab_api.set_speed_limit(limit)
-        except SabnzbdApiException as err:
-            _LOGGER.error(err)
-            return False
-
-    def get_queue_field(self, field):
-        """Return the value for the given field from the Sabnzbd queue."""
-        return self.sab_api.queue.get(field)
+    return unload_ok

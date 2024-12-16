@@ -1,15 +1,24 @@
 """Config flow to configure forked-daapd devices."""
+
+from contextlib import suppress
 import logging
+from typing import Any
 
 from pyforked_daapd import ForkedDaapdAPI
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.components import zeroconf
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_PORT
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import (  # pylint:disable=unused-import
+from .const import (
     CONF_LIBRESPOT_JAVA_PORT,
     CONF_MAX_PLAYLISTS,
     CONF_TTS_PAUSE_TIME,
@@ -31,6 +40,7 @@ DATA_SCHEMA_DICT = {
 }
 
 TEST_CONNECTION_ERROR_DICT = {
+    "forbidden": "forbidden",
     "ok": "ok",
     "websocket_not_enabled": "websocket_not_enabled",
     "wrong_host_or_port": "wrong_host_or_port",
@@ -39,14 +49,12 @@ TEST_CONNECTION_ERROR_DICT = {
 }
 
 
-class ForkedDaapdOptionsFlowHandler(config_entries.OptionsFlow):
+class ForkedDaapdOptionsFlowHandler(OptionsFlow):
     """Handle a forked-daapd options flow."""
 
-    def __init__(self, config_entry):
-        """Initialize."""
-        self.config_entry = config_entry
-
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
             return self.async_create_entry(title="options", data=user_input)
@@ -87,29 +95,30 @@ def fill_in_schema_dict(some_input):
     schema_dict = {}
     for field, _type in DATA_SCHEMA_DICT.items():
         if some_input.get(str(field)):
-            schema_dict[
-                vol.Optional(str(field), default=some_input[str(field)])
-            ] = _type
+            schema_dict[vol.Optional(str(field), default=some_input[str(field)])] = (
+                _type
+            )
         else:
             schema_dict[field] = _type
     return schema_dict
 
 
-class ForkedDaapdFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class ForkedDaapdFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a forked-daapd config flow."""
 
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_PUSH
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize."""
-        self.discovery_schema = None
+        self.discovery_schema: vol.Schema | None = None
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> ForkedDaapdOptionsFlowHandler:
         """Return options flow handler."""
-        return ForkedDaapdOptionsFlowHandler(config_entry)
+        return ForkedDaapdOptionsFlowHandler()
 
     async def validate_input(self, user_input):
         """Validate the user input."""
@@ -125,16 +134,16 @@ class ForkedDaapdFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return validate_result
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a forked-daapd config flow start.
 
         Manage device specific parameters.
         """
         if user_input is not None:
             # check for any entries with same host, abort if found
-            for entry in self._async_current_entries():
-                if entry.data[CONF_HOST] == user_input[CONF_HOST]:
-                    return self.async_abort(reason="already_configured")
+            self._async_abort_entries_match({CONF_HOST: user_input[CONF_HOST]})
             validate_result = await self.validate_input(user_input)
             if validate_result[0] == "ok":  # success
                 _LOGGER.debug("Connected successfully. Creating entry")
@@ -154,34 +163,37 @@ class ForkedDaapdFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=vol.Schema(DATA_SCHEMA_DICT), errors={}
         )
 
-    async def async_step_zeroconf(self, discovery_info):
+    async def async_step_zeroconf(
+        self, discovery_info: zeroconf.ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Prepare configuration for a discovered forked-daapd device."""
-        if not (
-            discovery_info.get("properties")
-            and int(discovery_info["properties"].get("mtd-version", "0").split(".")[0])
-            >= 27
-            and discovery_info["properties"].get("Machine Name")
-        ):
+        version_num = 0
+        zeroconf_properties = discovery_info.properties
+        if zeroconf_properties.get("Machine Name"):
+            with suppress(ValueError):
+                version_num = int(
+                    zeroconf_properties.get("mtd-version", "0").split(".")[0]
+                )
+        if version_num < 27:
             return self.async_abort(reason="not_forked_daapd")
-
-        await self.async_set_unique_id(discovery_info["properties"]["Machine Name"])
+        await self.async_set_unique_id(zeroconf_properties["Machine Name"])
         self._abort_if_unique_id_configured()
 
         # Update title and abort if we already have an entry for this host
         for entry in self._async_current_entries():
-            if entry.data.get(CONF_HOST) != discovery_info["host"]:
+            if entry.data.get(CONF_HOST) != discovery_info.host:
                 continue
             self.hass.config_entries.async_update_entry(
-                entry, title=discovery_info["properties"]["Machine Name"],
+                entry,
+                title=zeroconf_properties["Machine Name"],
             )
             return self.async_abort(reason="already_configured")
 
         zeroconf_data = {
-            CONF_HOST: discovery_info["host"],
-            CONF_PORT: int(discovery_info["port"]),
-            CONF_NAME: discovery_info["properties"]["Machine Name"],
+            CONF_HOST: discovery_info.host,
+            CONF_PORT: discovery_info.port,
+            CONF_NAME: zeroconf_properties["Machine Name"],
         }
         self.discovery_schema = vol.Schema(fill_in_schema_dict(zeroconf_data))
-        # pylint: disable=no-member # https://github.com/PyCQA/pylint/issues/3167
         self.context.update({"title_placeholders": zeroconf_data})
         return await self.async_step_user()

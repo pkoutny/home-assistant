@@ -1,15 +1,19 @@
 """Schemas used by insteon component."""
 
-from typing import Dict
+from __future__ import annotations
 
+from pyinsteon.constants import HC_LOOKUP
 import voluptuous as vol
 
 from homeassistant.const import (
     CONF_ADDRESS,
+    CONF_DEVICE,
     CONF_ENTITY_ID,
     CONF_HOST,
+    CONF_PASSWORD,
     CONF_PLATFORM,
     CONF_PORT,
+    CONF_USERNAME,
     ENTITY_MATCH_ALL,
 )
 import homeassistant.helpers.config_validation as cv
@@ -17,105 +21,21 @@ import homeassistant.helpers.config_validation as cv
 from .const import (
     CONF_CAT,
     CONF_DIM_STEPS,
-    CONF_FIRMWARE,
     CONF_HOUSECODE,
-    CONF_HUB_PASSWORD,
-    CONF_HUB_USERNAME,
     CONF_HUB_VERSION,
-    CONF_IP_PORT,
-    CONF_OVERRIDE,
-    CONF_PLM_HUB_MSG,
-    CONF_PRODUCT_KEY,
     CONF_SUBCAT,
     CONF_UNITCODE,
-    CONF_X10,
-    CONF_X10_ALL_LIGHTS_OFF,
-    CONF_X10_ALL_LIGHTS_ON,
-    CONF_X10_ALL_UNITS_OFF,
-    DOMAIN,
     HOUSECODES,
+    PORT_HUB_V1,
+    PORT_HUB_V2,
     SRV_ALL_LINK_GROUP,
     SRV_ALL_LINK_MODE,
     SRV_CONTROLLER,
     SRV_HOUSECODE,
     SRV_LOAD_DB_RELOAD,
     SRV_RESPONDER,
+    X10_PLATFORMS,
 )
-
-
-def set_default_port(schema: Dict) -> Dict:
-    """Set the default port based on the Hub version."""
-    # If the ip_port is found do nothing
-    # If it is not found the set the default
-    ip_port = schema.get(CONF_IP_PORT)
-    if not ip_port:
-        hub_version = schema.get(CONF_HUB_VERSION)
-        # Found hub_version but not ip_port
-        schema[CONF_IP_PORT] = 9761 if hub_version == 1 else 25105
-    return schema
-
-
-CONF_DEVICE_OVERRIDE_SCHEMA = vol.All(
-    vol.Schema(
-        {
-            vol.Required(CONF_ADDRESS): cv.string,
-            vol.Optional(CONF_CAT): cv.byte,
-            vol.Optional(CONF_SUBCAT): cv.byte,
-            vol.Optional(CONF_FIRMWARE): cv.byte,
-            vol.Optional(CONF_PRODUCT_KEY): cv.byte,
-            vol.Optional(CONF_PLATFORM): cv.string,
-        }
-    ),
-)
-
-
-CONF_X10_SCHEMA = vol.All(
-    vol.Schema(
-        {
-            vol.Required(CONF_HOUSECODE): cv.string,
-            vol.Required(CONF_UNITCODE): vol.Range(min=1, max=16),
-            vol.Required(CONF_PLATFORM): cv.string,
-            vol.Optional(CONF_DIM_STEPS): vol.Range(min=2, max=255),
-        }
-    )
-)
-
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.All(
-            cv.deprecated(CONF_X10_ALL_UNITS_OFF),
-            cv.deprecated(CONF_X10_ALL_LIGHTS_ON),
-            cv.deprecated(CONF_X10_ALL_LIGHTS_OFF),
-            vol.Schema(
-                {
-                    vol.Exclusive(
-                        CONF_PORT, "plm_or_hub", msg=CONF_PLM_HUB_MSG
-                    ): cv.string,
-                    vol.Exclusive(
-                        CONF_HOST, "plm_or_hub", msg=CONF_PLM_HUB_MSG
-                    ): cv.string,
-                    vol.Optional(CONF_IP_PORT): cv.port,
-                    vol.Optional(CONF_HUB_USERNAME): cv.string,
-                    vol.Optional(CONF_HUB_PASSWORD): cv.string,
-                    vol.Optional(CONF_HUB_VERSION, default=2): vol.In([1, 2]),
-                    vol.Optional(CONF_OVERRIDE): vol.All(
-                        cv.ensure_list_csv, [CONF_DEVICE_OVERRIDE_SCHEMA]
-                    ),
-                    vol.Optional(CONF_X10): vol.All(
-                        cv.ensure_list_csv, [CONF_X10_SCHEMA]
-                    ),
-                },
-                extra=vol.ALLOW_EXTRA,
-                required=True,
-            ),
-            cv.has_at_least_one_key(CONF_PORT, CONF_HOST),
-            set_default_port,
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
 
 ADD_ALL_LINK_SCHEMA = vol.Schema(
     {
@@ -150,3 +70,83 @@ TRIGGER_SCENE_SCHEMA = vol.Schema(
 
 
 ADD_DEFAULT_LINKS_SCHEMA = vol.Schema({vol.Required(CONF_ENTITY_ID): cv.entity_id})
+
+
+def build_device_override_schema(
+    address=vol.UNDEFINED,
+    cat=vol.UNDEFINED,
+    subcat=vol.UNDEFINED,
+    firmware=vol.UNDEFINED,
+):
+    """Build the device override schema for config flow."""
+    return vol.Schema(
+        {
+            vol.Required(CONF_ADDRESS, default=address): str,
+            vol.Optional(CONF_CAT, default=cat): str,
+            vol.Optional(CONF_SUBCAT, default=subcat): str,
+        }
+    )
+
+
+def build_x10_schema(
+    housecode=vol.UNDEFINED,
+    unitcode=vol.UNDEFINED,
+    platform=vol.UNDEFINED,
+    dim_steps=22,
+):
+    """Build the X10 schema for config flow."""
+    if platform == "light":
+        dim_steps_schema = vol.Required(CONF_DIM_STEPS, default=dim_steps)
+    else:
+        dim_steps_schema = vol.Optional(CONF_DIM_STEPS, default=dim_steps)
+    return vol.Schema(
+        {
+            vol.Required(CONF_HOUSECODE, default=housecode): vol.In(HC_LOOKUP.keys()),
+            vol.Required(CONF_UNITCODE, default=unitcode): vol.In(range(1, 17)),
+            vol.Required(CONF_PLATFORM, default=platform): vol.In(X10_PLATFORMS),
+            dim_steps_schema: vol.Range(min=0, max=255),
+        }
+    )
+
+
+def _find_likely_port(ports):
+    """Return the most likely USB port for a PLM."""
+    test_strings = ["FTDI", "0403:6001", "10BF:"]
+    for port, name in ports.items():
+        for test_string in test_strings:
+            if test_string in name:
+                return port
+    return vol.UNDEFINED
+
+
+def build_plm_schema(ports: dict[str, str], device=vol.UNDEFINED):
+    """Build the PLM schema for config flow."""
+    if not device or device == vol.UNDEFINED:
+        device = _find_likely_port(ports)
+    return vol.Schema({vol.Required(CONF_DEVICE, default=device): vol.In(ports)})
+
+
+def build_plm_manual_schema(device=vol.UNDEFINED):
+    """Build the manual PLM schema for config flow."""
+    return vol.Schema({vol.Required(CONF_DEVICE, default=device): str})
+
+
+def build_hub_schema(
+    hub_version,
+    host=vol.UNDEFINED,
+    port=vol.UNDEFINED,
+    username=vol.UNDEFINED,
+    password=vol.UNDEFINED,
+):
+    """Build the Hub schema for config flow."""
+    if port == vol.UNDEFINED:
+        port = PORT_HUB_V2 if hub_version == 2 else PORT_HUB_V1
+    schema = {
+        vol.Required(CONF_HOST, default=host): str,
+        vol.Required(CONF_PORT, default=port): int,
+        vol.Required(CONF_HUB_VERSION, default=hub_version): int,
+    }
+    if hub_version == 2:
+        schema[vol.Required(CONF_USERNAME, default=username)] = str
+        schema[vol.Required(CONF_PASSWORD, default=password)] = str
+    return vol.Schema(schema)

@@ -1,18 +1,28 @@
 """Support for Sony projectors via SDCP network control."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
 
 import pysdcp
 import voluptuous as vol
 
-from homeassistant.components.switch import PLATFORM_SCHEMA, SwitchEntity
+from homeassistant.components.switch import (
+    PLATFORM_SCHEMA as SWITCH_PLATFORM_SCHEMA,
+    SwitchEntity,
+)
 from homeassistant.const import CONF_HOST, CONF_NAME, STATE_OFF, STATE_ON
+from homeassistant.core import HomeAssistant
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NAME = "Sony Projector"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SWITCH_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_HOST): cv.string,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
@@ -20,7 +30,12 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+def setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Connect to Sony projector using network."""
 
     host = config[CONF_HOST]
@@ -32,10 +47,9 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         sdcp_connection.get_power()
     except ConnectionError:
         _LOGGER.error("Failed to connect to projector '%s'", host)
-        return False
+        return
     _LOGGER.debug("Validated projector '%s' OK", host)
     add_entities([SonyProjector(sdcp_connection, name)], True)
-    return True
 
 
 class SonyProjector(SwitchEntity):
@@ -65,11 +79,11 @@ class SonyProjector(SwitchEntity):
         return self._state
 
     @property
-    def state_attributes(self):
+    def extra_state_attributes(self):
         """Return state attributes."""
         return self._attributes
 
-    def update(self):
+    def update(self) -> None:
         """Get the latest state from the projector."""
         try:
             self._state = self._sdcp.get_power()
@@ -78,20 +92,20 @@ class SonyProjector(SwitchEntity):
             _LOGGER.error("Projector connection refused")
             self._available = False
 
-    def turn_on(self, **kwargs):
+    def turn_on(self, **kwargs: Any) -> None:
         """Turn the projector on."""
-        _LOGGER.debug("Powering on projector '%s'...", self.name)
+        _LOGGER.debug("Powering on projector '%s'", self.name)
         if self._sdcp.set_power(True):
-            _LOGGER.debug("Powered on successfully.")
+            _LOGGER.debug("Powered on successfully")
             self._state = STATE_ON
         else:
             _LOGGER.error("Power on command was not successful")
 
-    def turn_off(self, **kwargs):
+    def turn_off(self, **kwargs: Any) -> None:
         """Turn the projector off."""
-        _LOGGER.debug("Powering off projector '%s'...", self.name)
+        _LOGGER.debug("Powering off projector '%s'", self.name)
         if self._sdcp.set_power(False):
-            _LOGGER.debug("Powered off successfully.")
+            _LOGGER.debug("Powered off successfully")
             self._state = STATE_OFF
         else:
             _LOGGER.error("Power off command was not successful")

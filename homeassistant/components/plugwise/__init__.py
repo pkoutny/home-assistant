@@ -1,201 +1,100 @@
 """Plugwise platform for Home Assistant Core."""
 
-import asyncio
-from datetime import timedelta
-import logging
-from typing import Dict
+from __future__ import annotations
 
-from Plugwise_Smile.Smile import Smile
-import async_timeout
-import voluptuous as vol
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 
-from .const import DOMAIN
+from .const import DOMAIN, LOGGER, PLATFORMS
+from .coordinator import PlugwiseDataUpdateCoordinator
 
-CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({})}, extra=vol.ALLOW_EXTRA)
-
-_LOGGER = logging.getLogger(__name__)
-
-SENSOR_PLATFORMS = ["sensor"]
-ALL_PLATFORMS = ["binary_sensor", "climate", "sensor", "switch"]
+type PlugwiseConfigEntry = ConfigEntry[PlugwiseDataUpdateCoordinator]
 
 
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the Plugwise platform."""
-    return True
+async def async_setup_entry(hass: HomeAssistant, entry: PlugwiseConfigEntry) -> bool:
+    """Set up Plugwise components from a config entry."""
+    await er.async_migrate_entries(hass, entry.entry_id, async_migrate_entity_entry)
 
+    coordinator = PlugwiseDataUpdateCoordinator(hass)
+    await coordinator.async_config_entry_first_refresh()
+    migrate_sensor_entities(hass, coordinator)
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Plugwise Smiles from a config entry."""
-    websession = async_get_clientsession(hass, verify_ssl=False)
-    api = Smile(
-        host=entry.data["host"], password=entry.data["password"], websession=websession
-    )
+    entry.runtime_data = coordinator
 
-    try:
-        connected = await api.connect()
-
-        if not connected:
-            _LOGGER.error("Unable to connect to Smile")
-            raise ConfigEntryNotReady
-
-    except Smile.InvalidAuthentication:
-        _LOGGER.error("Invalid Smile ID")
-        return False
-
-    except Smile.PlugwiseError:
-        _LOGGER.error("Error while communicating to device")
-        raise ConfigEntryNotReady
-
-    except asyncio.TimeoutError:
-        _LOGGER.error("Timeout while connecting to Smile")
-        raise ConfigEntryNotReady
-
-    update_interval = timedelta(seconds=60)
-    if api.smile_type == "power":
-        update_interval = timedelta(seconds=10)
-
-    async def async_update_data():
-        """Update data via API endpoint."""
-        try:
-            async with async_timeout.timeout(10):
-                await api.full_update_device()
-                return True
-        except Smile.XMLDataMissingError:
-            raise UpdateFailed("Smile update failed")
-
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        name="Smile",
-        update_method=async_update_data,
-        update_interval=update_interval,
-    )
-
-    await coordinator.async_refresh()
-
-    if not coordinator.last_update_success:
-        raise ConfigEntryNotReady
-
-    api.get_all_devices()
-
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        "api": api,
-        "coordinator": coordinator,
-    }
-
-    device_registry = await dr.async_get_registry(hass)
+    device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, api.gateway_id)},
+        identifiers={(DOMAIN, str(coordinator.api.gateway_id))},
         manufacturer="Plugwise",
-        name=entry.title,
-        model=f"Smile {api.smile_name}",
-        sw_version=api.smile_version[0],
-    )
+        model=coordinator.api.smile_model,
+        model_id=coordinator.api.smile_model_id,
+        name=coordinator.api.smile_name,
+        sw_version=str(coordinator.api.smile_version),
+    )  # required for adding the entity-less P1 Gateway
 
-    single_master_thermostat = api.single_master_thermostat()
-
-    platforms = ALL_PLATFORMS
-    if single_master_thermostat is None:
-        platforms = SENSOR_PLATFORMS
-
-    for component in platforms:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
-        )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in ALL_PLATFORMS
-            ]
-        )
-    )
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+async def async_unload_entry(hass: HomeAssistant, entry: PlugwiseConfigEntry) -> bool:
+    """Unload the Plugwise components."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
-class SmileGateway(Entity):
-    """Represent Smile Gateway."""
+@callback
+def async_migrate_entity_entry(entry: er.RegistryEntry) -> dict[str, Any] | None:
+    """Migrate Plugwise entity entries.
 
-    def __init__(self, api, coordinator, name, dev_id):
-        """Initialise the gateway."""
-        self._api = api
-        self._coordinator = coordinator
-        self._name = name
-        self._dev_id = dev_id
-
-        self._unique_id = None
-        self._model = None
-
-        self._entity_name = self._name
-
-    @property
-    def unique_id(self):
-        """Return a unique ID."""
-        return self._unique_id
-
-    @property
-    def should_poll(self):
-        """Return False, updates are controlled via coordinator."""
-        return False
-
-    @property
-    def available(self):
-        """Return True if entity is available."""
-        return self._coordinator.last_update_success
-
-    @property
-    def name(self):
-        """Return the name of the entity, if any."""
-        return self._name
-
-    @property
-    def device_info(self) -> Dict[str, any]:
-        """Return the device information."""
-
-        device_information = {
-            "identifiers": {(DOMAIN, self._dev_id)},
-            "name": self._entity_name,
-            "manufacturer": "Plugwise",
+    - Migrates old unique ID's from old binary_sensors and switches to the new unique ID's
+    """
+    if entry.domain == Platform.BINARY_SENSOR and entry.unique_id.endswith(
+        "-slave_boiler_state"
+    ):
+        return {
+            "new_unique_id": entry.unique_id.replace(
+                "-slave_boiler_state", "-secondary_boiler_state"
+            )
         }
+    if entry.domain == Platform.SENSOR and entry.unique_id.endswith(
+        "-relative_humidity"
+    ):
+        return {
+            "new_unique_id": entry.unique_id.replace("-relative_humidity", "-humidity")
+        }
+    if entry.domain == Platform.SWITCH and entry.unique_id.endswith("-plug"):
+        return {"new_unique_id": entry.unique_id.replace("-plug", "-relay")}
 
-        if self._model is not None:
-            device_information["model"] = self._model.replace("_", " ").title()
+    # No migration needed
+    return None
 
-        if self._dev_id != self._api.gateway_id:
-            device_information["via_device"] = (DOMAIN, self._api.gateway_id)
 
-        return device_information
+def migrate_sensor_entities(
+    hass: HomeAssistant,
+    coordinator: PlugwiseDataUpdateCoordinator,
+) -> None:
+    """Migrate Sensors if needed."""
+    ent_reg = er.async_get(hass)
 
-    async def async_added_to_hass(self):
-        """Subscribe to updates."""
-        self._async_process_data()
-        self.async_on_remove(
-            self._coordinator.async_add_listener(self._async_process_data)
-        )
+    # Migrating opentherm_outdoor_temperature
+    # to opentherm_outdoor_air_temperature sensor
+    for device_id, device in coordinator.data.devices.items():
+        if device["dev_class"] != "heater_central":
+            continue
 
-    @callback
-    def _async_process_data(self):
-        """Interpret and process API data."""
-        raise NotImplementedError
-
-    async def async_update(self):
-        """Update the entity."""
-        await self._coordinator.async_request_refresh()
+        old_unique_id = f"{device_id}-outdoor_temperature"
+        if entity_id := ent_reg.async_get_entity_id(
+            Platform.SENSOR, DOMAIN, old_unique_id
+        ):
+            new_unique_id = f"{device_id}-outdoor_air_temperature"
+            LOGGER.debug(
+                "Migrating entity %s from old unique ID '%s' to new unique ID '%s'",
+                entity_id,
+                old_unique_id,
+                new_unique_id,
+            )
+            ent_reg.async_update_entity(entity_id, new_unique_id=new_unique_id)

@@ -1,21 +1,8 @@
 {
-  "config": {
-    "step": {
-      "user": {
-        "title": "Connect to the MyQ Gateway",
-        "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
-        }
-      }
-    },
-    "error": {
-      "cannot_connect": "Failed to connect, please try again",
-      "invalid_auth": "Invalid authentication",
-      "unknown": "Unexpected error"
-    },
-    "abort": {
-      "already_configured": "MyQ is already configured"
+  "issues": {
+    "integration_removed": {
+      "title": "The MyQ integration has been removed",
+      "description": "The MyQ integration has been removed from Home Assistant.\n\nMyQ has blocked all third-party integrations. Read about it [here]({blog}).\n\nTo resolve this issue, please remove the (now defunct) integration entries from your Home Assistant setup. [Click here to see your existing MyQ integration entries]({entries})."
     }
   }
 }

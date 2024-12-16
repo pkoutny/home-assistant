@@ -1,6 +1,8 @@
 """Tests for Minio Hass related code."""
+
 import asyncio
 import json
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -15,11 +17,10 @@ from homeassistant.components.minio import (
     DOMAIN,
     QueueListener,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.setup import async_setup_component
 
-from tests.async_mock import MagicMock, call, patch
-from tests.components.minio.common import TEST_EVENT
+from .common import TEST_EVENT
 
 
 @pytest.fixture(name="minio_client")
@@ -52,9 +53,11 @@ def minio_client_event_fixture():
         yield minio_client_mock
 
 
-async def test_minio_services(hass, caplog, minio_client):
+async def test_minio_services(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, minio_client
+) -> None:
     """Test Minio services."""
-    hass.config.whitelist_external_dirs = set("/test")
+    hass.config.allowlist_external_dirs = {"/test"}
 
     await async_setup_component(
         hass,
@@ -72,8 +75,6 @@ async def test_minio_services(hass, caplog, minio_client):
 
     await hass.async_start()
     await hass.async_block_till_done()
-
-    assert "Setup of domain minio took" in caplog.text
 
     # Call services
     await hass.services.async_call(
@@ -105,7 +106,9 @@ async def test_minio_services(hass, caplog, minio_client):
     minio_client.reset_mock()
 
 
-async def test_minio_listen(hass, caplog, minio_client_event):
+async def test_minio_listen(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, minio_client_event
+) -> None:
     """Test minio listen on notifications."""
     minio_client_event.presigned_get_object.return_value = "http://url"
 
@@ -136,24 +139,22 @@ async def test_minio_listen(hass, caplog, minio_client_event):
     await hass.async_start()
     await hass.async_block_till_done()
 
-    assert "Setup of domain minio took" in caplog.text
-
     while not events:
         await asyncio.sleep(0)
 
-    assert 1 == len(events)
+    assert len(events) == 1
     event = events[0]
 
-    assert DOMAIN == event.event_type
-    assert "s3:ObjectCreated:Put" == event.data["event_name"]
-    assert "5jJkTAo.jpg" == event.data["file_name"]
-    assert "test" == event.data["bucket"]
-    assert "5jJkTAo.jpg" == event.data["key"]
-    assert "http://url" == event.data["presigned_url"]
-    assert 0 == len(event.data["metadata"])
+    assert event.event_type == DOMAIN
+    assert event.data["event_name"] == "s3:ObjectCreated:Put"
+    assert event.data["file_name"] == "5jJkTAo.jpg"
+    assert event.data["bucket"] == "test"
+    assert event.data["key"] == "5jJkTAo.jpg"
+    assert event.data["presigned_url"] == "http://url"
+    assert len(event.data["metadata"]) == 0
 
 
-async def test_queue_listener():
+async def test_queue_listener() -> None:
     """Tests QueueListener firing events on Home Assistant event bus."""
     hass = MagicMock()
 
@@ -183,7 +184,7 @@ async def test_queue_listener():
         "metadata": {},
     }
 
-    assert DOMAIN == call_domain
+    assert call_domain == DOMAIN
     assert json.dumps(expected_event, sort_keys=True) == json.dumps(
         call_event, sort_keys=True
     )

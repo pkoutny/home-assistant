@@ -1,4 +1,7 @@
 """Optical character recognition processing of seven segments displays."""
+
+from __future__ import annotations
+
 import io
 import logging
 import os
@@ -8,14 +11,15 @@ from PIL import Image
 import voluptuous as vol
 
 from homeassistant.components.image_processing import (
-    CONF_ENTITY_ID,
-    CONF_NAME,
-    CONF_SOURCE,
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as IMAGE_PROCESSING_PLATFORM_SCHEMA,
+    ImageProcessingDeviceClass,
     ImageProcessingEntity,
 )
-from homeassistant.core import split_entity_id
+from homeassistant.const import CONF_ENTITY_ID, CONF_NAME, CONF_SOURCE
+from homeassistant.core import HomeAssistant, split_entity_id
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ CONF_Y_POS = "y_position"
 
 DEFAULT_BINARY = "ssocr"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = IMAGE_PROCESSING_PLATFORM_SCHEMA.extend(
     {
         vol.Optional(CONF_EXTRA_ARGUMENTS, default=""): cv.string,
         vol.Optional(CONF_DIGITS): cv.positive_int,
@@ -46,21 +50,25 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the Seven segments OCR platform."""
-    entities = []
-    for camera in config[CONF_SOURCE]:
-        entities.append(
-            ImageProcessingSsocr(
-                hass, camera[CONF_ENTITY_ID], config, camera.get(CONF_NAME)
-            )
+    async_add_entities(
+        ImageProcessingSsocr(
+            hass, camera[CONF_ENTITY_ID], config, camera.get(CONF_NAME)
         )
-
-    async_add_entities(entities)
+        for camera in config[CONF_SOURCE]
+    )
 
 
 class ImageProcessingSsocr(ImageProcessingEntity):
     """Representation of the seven segments OCR image processing entity."""
+
+    _attr_device_class = ImageProcessingDeviceClass.OCR
 
     def __init__(self, hass, camera_entity, config, name):
         """Initialize seven segments processing."""
@@ -69,12 +77,12 @@ class ImageProcessingSsocr(ImageProcessingEntity):
         if name:
             self._name = name
         else:
-            self._name = "SevenSegment OCR {}".format(split_entity_id(camera_entity)[1])
+            self._name = f"SevenSegment OCR {split_entity_id(camera_entity)[1]}"
         self._state = None
 
         self.filepath = os.path.join(
             self.hass.config.config_dir,
-            "ssocr-{}.png".format(self._name.replace(" ", "_")),
+            f"ssocr-{self._name.replace(' ', '_')}.png",
         )
         crop = [
             "crop",
@@ -88,20 +96,15 @@ class ImageProcessingSsocr(ImageProcessingEntity):
         threshold = ["-t", str(config[CONF_THRESHOLD])]
         extra_arguments = config[CONF_EXTRA_ARGUMENTS].split(" ")
 
-        self._command = (
-            [config[CONF_SSOCR_BIN]]
-            + crop
-            + digits
-            + threshold
-            + rotate
-            + extra_arguments
-        )
+        self._command = [
+            config[CONF_SSOCR_BIN],
+            *crop,
+            *digits,
+            *threshold,
+            *rotate,
+            *extra_arguments,
+        ]
         self._command.append(self.filepath)
-
-    @property
-    def device_class(self):
-        """Return the class of this device, from component DEVICE_CLASSES."""
-        return "ocr"
 
     @property
     def camera_entity(self):
@@ -124,14 +127,17 @@ class ImageProcessingSsocr(ImageProcessingEntity):
         img = Image.open(stream)
         img.save(self.filepath, "png")
 
-        ocr = subprocess.Popen(
-            self._command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        out = ocr.communicate()
-        if out[0] != b"":
-            self._state = out[0].strip().decode("utf-8")
-        else:
-            self._state = None
-            _LOGGER.warning(
-                "Unable to detect value: %s", out[1].strip().decode("utf-8")
-            )
+        with subprocess.Popen(
+            self._command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=False,  # Required for posix_spawn
+        ) as ocr:
+            out = ocr.communicate()
+            if out[0] != b"":
+                self._state = out[0].strip().decode("utf-8")
+            else:
+                self._state = None
+                _LOGGER.warning(
+                    "Unable to detect value: %s", out[1].strip().decode("utf-8")
+                )

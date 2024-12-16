@@ -1,71 +1,40 @@
 """Tests for Plex server."""
+
 import copy
+from unittest.mock import patch
 
-from plexapi.exceptions import NotFound
+import pytest
+from requests.exceptions import ConnectionError, RequestException
+import requests_mock
 
-from homeassistant.components.media_player import DOMAIN as MP_DOMAIN
-from homeassistant.components.media_player.const import (
-    ATTR_MEDIA_CONTENT_ID,
-    ATTR_MEDIA_CONTENT_TYPE,
-    MEDIA_TYPE_EPISODE,
-    MEDIA_TYPE_MUSIC,
-    MEDIA_TYPE_PLAYLIST,
-    MEDIA_TYPE_VIDEO,
-    SERVICE_PLAY_MEDIA,
-)
 from homeassistant.components.plex.const import (
     CONF_IGNORE_NEW_SHARED_USERS,
     CONF_IGNORE_PLEX_WEB_CLIENTS,
     CONF_MONITORED_USERS,
+    CONF_SERVER,
     DOMAIN,
-    PLEX_UPDATE_PLATFORMS_SIGNAL,
     SERVERS,
 )
-from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
 
 from .const import DEFAULT_DATA, DEFAULT_OPTIONS
-from .mock_classes import (
-    MockPlexAccount,
-    MockPlexArtist,
-    MockPlexLibrary,
-    MockPlexLibrarySection,
-    MockPlexMediaItem,
-    MockPlexServer,
-)
-
-from tests.async_mock import patch
-from tests.common import MockConfigEntry
+from .helpers import trigger_plex_update, wait_for_debouncer
 
 
-async def test_new_users_available(hass):
+async def test_new_users_available(
+    hass: HomeAssistant, entry, setup_plex_server
+) -> None:
     """Test setting up when new users available on Plex server."""
-
-    MONITORED_USERS = {"Owner": {"enabled": True}}
+    MONITORED_USERS = {"User 1": {"enabled": True}}
     OPTIONS_WITH_USERS = copy.deepcopy(DEFAULT_OPTIONS)
-    OPTIONS_WITH_USERS[MP_DOMAIN][CONF_MONITORED_USERS] = MONITORED_USERS
+    OPTIONS_WITH_USERS[Platform.MEDIA_PLAYER][CONF_MONITORED_USERS] = MONITORED_USERS
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(entry, options=OPTIONS_WITH_USERS)
 
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=DEFAULT_DATA,
-        options=OPTIONS_WITH_USERS,
-        unique_id=DEFAULT_DATA["server_id"],
-    )
+    mock_plex_server = await setup_plex_server(config_entry=entry)
 
-    mock_plex_server = MockPlexServer(config_entry=entry)
-
-    with patch("plexapi.server.PlexServer", return_value=mock_plex_server), patch(
-        "homeassistant.components.plex.PlexWebsocket.listen"
-    ):
-        entry.add_to_hass(hass)
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-
-    server_id = mock_plex_server.machineIdentifier
-
-    with patch("plexapi.myplex.MyPlexAccount", return_value=MockPlexAccount()):
-        async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-        await hass.async_block_till_done()
+    server_id = mock_plex_server.machine_identifier
 
     monitored_users = hass.data[DOMAIN][SERVERS][server_id].option_monitored_users
 
@@ -73,419 +42,148 @@ async def test_new_users_available(hass):
     assert len(monitored_users) == 1
     assert len(ignored_users) == 0
 
-    sensor = hass.states.get("sensor.plex_plex_server_1")
-    assert sensor.state == str(len(mock_plex_server.accounts))
 
-
-async def test_new_ignored_users_available(hass, caplog):
+async def test_new_ignored_users_available(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    entry,
+    mock_websocket,
+    setup_plex_server,
+    requests_mock: requests_mock.Mocker,
+    session_new_user,
+) -> None:
     """Test setting up when new users available on Plex server but are ignored."""
-
-    MONITORED_USERS = {"Owner": {"enabled": True}}
+    MONITORED_USERS = {"User 1": {"enabled": True}}
     OPTIONS_WITH_USERS = copy.deepcopy(DEFAULT_OPTIONS)
-    OPTIONS_WITH_USERS[MP_DOMAIN][CONF_MONITORED_USERS] = MONITORED_USERS
-    OPTIONS_WITH_USERS[MP_DOMAIN][CONF_IGNORE_NEW_SHARED_USERS] = True
+    OPTIONS_WITH_USERS[Platform.MEDIA_PLAYER][CONF_MONITORED_USERS] = MONITORED_USERS
+    OPTIONS_WITH_USERS[Platform.MEDIA_PLAYER][CONF_IGNORE_NEW_SHARED_USERS] = True
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(entry, options=OPTIONS_WITH_USERS)
 
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=DEFAULT_DATA,
-        options=OPTIONS_WITH_USERS,
-        unique_id=DEFAULT_DATA["server_id"],
+    mock_plex_server = await setup_plex_server(config_entry=entry)
+
+    requests_mock.get(
+        f"{mock_plex_server.url_in_use}/status/sessions",
+        text=session_new_user,
     )
+    trigger_plex_update(mock_websocket)
+    await wait_for_debouncer(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
 
-    mock_plex_server = MockPlexServer(config_entry=entry)
+    server_id = mock_plex_server.machine_identifier
 
-    with patch("plexapi.server.PlexServer", return_value=mock_plex_server), patch(
-        "homeassistant.components.plex.PlexWebsocket.listen"
-    ):
-        entry.add_to_hass(hass)
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-
-    server_id = mock_plex_server.machineIdentifier
-
-    with patch("plexapi.myplex.MyPlexAccount", return_value=MockPlexAccount()):
-        async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-        await hass.async_block_till_done()
-
+    active_sessions = mock_plex_server._plex_server.sessions()
     monitored_users = hass.data[DOMAIN][SERVERS][server_id].option_monitored_users
-
     ignored_users = [x for x in mock_plex_server.accounts if x not in monitored_users]
+
     assert len(monitored_users) == 1
     assert len(ignored_users) == 2
+
     for ignored_user in ignored_users:
         ignored_client = [
-            x.players[0]
-            for x in mock_plex_server.sessions()
-            if x.usernames[0] == ignored_user
-        ][0]
-        assert (
-            f"Ignoring {ignored_client.product} client owned by '{ignored_user}'"
-            in caplog.text
-        )
+            x.players[0] for x in active_sessions if x.usernames[0] == ignored_user
+        ]
+        if ignored_client:
+            assert (
+                f"Ignoring {ignored_client[0].product} client owned by '{ignored_user}'"
+                in caplog.text
+            )
 
-    sensor = hass.states.get("sensor.plex_plex_server_1")
-    assert sensor.state == str(len(mock_plex_server.accounts))
+    await wait_for_debouncer(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
 
-
-# class TestClockedPlex(ClockedTestCase):
-#     """Create clock-controlled tests.async_mock class."""
-
-#     async def setUp(self):
-#         """Initialize this test class."""
-#         self.hass = await async_test_home_assistant(self.loop)
-
-#     async def tearDown(self):
-#         """Clean up the HomeAssistant instance."""
-#         await self.hass.async_stop()
-
-#     async def test_mark_sessions_idle(self):
-#         """Test marking media_players as idle when sessions end."""
-#         hass = self.hass
-
-#         entry = MockConfigEntry(
-#             domain=DOMAIN,
-#             data=DEFAULT_DATA,
-#             options=DEFAULT_OPTIONS,
-#             unique_id=DEFAULT_DATA["server_id"],
-#         )
-
-#         mock_plex_server = MockPlexServer(config_entry=entry)
-
-#         with patch("plexapi.server.PlexServer", return_value=mock_plex_server), patch(
-#             "homeassistant.components.plex.PlexWebsocket.listen"
-#         ):
-#             entry.add_to_hass(hass)
-#             assert await hass.config_entries.async_setup(entry.entry_id)
-#             await hass.async_block_till_done()
-
-#         server_id = mock_plex_server.machineIdentifier
-
-#         async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-#         await hass.async_block_till_done()
-
-#         sensor = hass.states.get("sensor.plex_plex_server_1")
-#         assert sensor.state == str(len(mock_plex_server.accounts))
-
-#         mock_plex_server.clear_clients()
-#         mock_plex_server.clear_sessions()
-
-#         await self.advance(DEBOUNCE_TIMEOUT)
-#         async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-#         await hass.async_block_till_done()
-
-#         sensor = hass.states.get("sensor.plex_plex_server_1")
-#         assert sensor.state == "0"
-
-#     async def test_debouncer(self):
-#         """Test debouncer behavior."""
-#         hass = self.hass
-
-#         entry = MockConfigEntry(
-#             domain=DOMAIN,
-#             data=DEFAULT_DATA,
-#             options=DEFAULT_OPTIONS,
-#             unique_id=DEFAULT_DATA["server_id"],
-#         )
-
-#         mock_plex_server = MockPlexServer(config_entry=entry)
-
-#         with patch("plexapi.server.PlexServer", return_value=mock_plex_server), patch(
-#             "homeassistant.components.plex.PlexWebsocket.listen"
-#         ):
-#             entry.add_to_hass(hass)
-#             assert await hass.config_entries.async_setup(entry.entry_id)
-#             await hass.async_block_till_done()
-
-#         server_id = mock_plex_server.machineIdentifier
-
-#         with patch.object(mock_plex_server, "clients", return_value=[]), patch.object(
-#             mock_plex_server, "sessions", return_value=[]
-#         ) as mock_update:
-#             # Called immediately
-#             async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-#             await hass.async_block_till_done()
-#             assert mock_update.call_count == 1
-
-#             # Throttled
-#             async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-#             await hass.async_block_till_done()
-#             assert mock_update.call_count == 1
-
-#             # Throttled
-#             async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-#             await hass.async_block_till_done()
-#             assert mock_update.call_count == 1
-
-#             # Called from scheduler
-#             await self.advance(DEBOUNCE_TIMEOUT)
-#             await hass.async_block_till_done()
-#             assert mock_update.call_count == 2
-
-#             # Throttled
-#             async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-#             await hass.async_block_till_done()
-#             assert mock_update.call_count == 2
-
-#             # Called from scheduler
-#             await self.advance(DEBOUNCE_TIMEOUT)
-#             await hass.async_block_till_done()
-#             assert mock_update.call_count == 3
+    sensor = hass.states.get("sensor.plex_server_1")
+    assert sensor.state == str(len(active_sessions))
 
 
-async def test_ignore_plex_web_client(hass):
-    """Test option to ignore Plex Web clients."""
+async def test_network_error_during_refresh(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, mock_plex_server
+) -> None:
+    """Test network failures during refreshes."""
+    server_id = mock_plex_server.machine_identifier
+    loaded_server = hass.data[DOMAIN][SERVERS][server_id]
+    active_sessions = mock_plex_server._plex_server.sessions()
 
-    OPTIONS = copy.deepcopy(DEFAULT_OPTIONS)
-    OPTIONS[MP_DOMAIN][CONF_IGNORE_PLEX_WEB_CLIENTS] = True
+    await wait_for_debouncer(hass)
 
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=DEFAULT_DATA,
-        options=OPTIONS,
-        unique_id=DEFAULT_DATA["server_id"],
+    sensor = hass.states.get("sensor.plex_server_1")
+    assert sensor.state == str(len(active_sessions))
+
+    with patch("plexapi.server.PlexServer.clients", side_effect=RequestException):
+        await loaded_server._async_update_platforms()
+        await hass.async_block_till_done()
+
+    assert (
+        f"Could not connect to Plex server: {DEFAULT_DATA[CONF_SERVER]}" in caplog.text
     )
 
-    mock_plex_server = MockPlexServer(config_entry=entry)
 
-    with patch("plexapi.server.PlexServer", return_value=mock_plex_server), patch(
-        "homeassistant.components.plex.PlexWebsocket.listen"
+async def test_gdm_client_failure(
+    hass: HomeAssistant, mock_websocket, setup_plex_server
+) -> None:
+    """Test connection failure to a GDM discovered client."""
+    with patch(
+        "homeassistant.components.plex.server.PlexClient", side_effect=ConnectionError
     ):
-        entry.add_to_hass(hass)
-        assert await hass.config_entries.async_setup(entry.entry_id)
+        mock_plex_server = await setup_plex_server(disable_gdm=False)
         await hass.async_block_till_done()
 
-    server_id = mock_plex_server.machineIdentifier
+    active_sessions = mock_plex_server._plex_server.sessions()
+    await wait_for_debouncer(hass)
 
-    with patch("plexapi.myplex.MyPlexAccount", return_value=MockPlexAccount(players=0)):
-        async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
+    sensor = hass.states.get("sensor.plex_server_1")
+    assert sensor.state == str(len(active_sessions))
+
+    with patch("plexapi.server.PlexServer.clients", side_effect=RequestException):
+        trigger_plex_update(mock_websocket)
         await hass.async_block_till_done()
 
-    sensor = hass.states.get("sensor.plex_plex_server_1")
-    assert sensor.state == str(len(mock_plex_server.accounts))
+
+async def test_mark_sessions_idle(
+    hass: HomeAssistant,
+    mock_plex_server,
+    mock_websocket,
+    requests_mock: requests_mock.Mocker,
+    empty_payload,
+) -> None:
+    """Test marking media_players as idle when sessions end."""
+    await wait_for_debouncer(hass)
+
+    active_sessions = mock_plex_server._plex_server.sessions()
+
+    sensor = hass.states.get("sensor.plex_server_1")
+    assert sensor.state == str(len(active_sessions))
+
+    url = mock_plex_server.url_in_use
+    requests_mock.get(f"{url}/clients", text=empty_payload)
+    requests_mock.get(f"{url}/status/sessions", text=empty_payload)
+
+    trigger_plex_update(mock_websocket)
+    await hass.async_block_till_done()
+    await wait_for_debouncer(hass)
+
+    sensor = hass.states.get("sensor.plex_server_1")
+    assert sensor.state == "0"
+
+
+async def test_ignore_plex_web_client(
+    hass: HomeAssistant, entry, setup_plex_server
+) -> None:
+    """Test option to ignore Plex Web clients."""
+    OPTIONS = copy.deepcopy(DEFAULT_OPTIONS)
+    OPTIONS[Platform.MEDIA_PLAYER][CONF_IGNORE_PLEX_WEB_CLIENTS] = True
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(entry, options=OPTIONS)
+
+    mock_plex_server = await setup_plex_server(
+        config_entry=entry, client_type="plexweb", disable_clients=True
+    )
+    await wait_for_debouncer(hass)
+
+    active_sessions = mock_plex_server._plex_server.sessions()
+    sensor = hass.states.get("sensor.plex_server_1")
+    assert sensor.state == str(len(active_sessions))
 
     media_players = hass.states.async_entity_ids("media_player")
 
     assert len(media_players) == int(sensor.state) - 1
-
-
-async def test_media_lookups(hass):
-    """Test media lookups to Plex server."""
-
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=DEFAULT_DATA,
-        options=DEFAULT_OPTIONS,
-        unique_id=DEFAULT_DATA["server_id"],
-    )
-
-    mock_plex_server = MockPlexServer(config_entry=entry)
-
-    with patch("plexapi.server.PlexServer", return_value=mock_plex_server), patch(
-        "homeassistant.components.plex.PlexWebsocket.listen"
-    ):
-        entry.add_to_hass(hass)
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-
-    server_id = mock_plex_server.machineIdentifier
-    loaded_server = hass.data[DOMAIN][SERVERS][server_id]
-
-    # Plex Key searches
-    with patch("plexapi.myplex.MyPlexAccount", return_value=MockPlexAccount()):
-        async_dispatcher_send(hass, PLEX_UPDATE_PLATFORMS_SIGNAL.format(server_id))
-        await hass.async_block_till_done()
-    media_player_id = hass.states.async_entity_ids("media_player")[0]
-    with patch("homeassistant.components.plex.PlexServer.create_playqueue"):
-        assert await hass.services.async_call(
-            MP_DOMAIN,
-            SERVICE_PLAY_MEDIA,
-            {
-                ATTR_ENTITY_ID: media_player_id,
-                ATTR_MEDIA_CONTENT_TYPE: DOMAIN,
-                ATTR_MEDIA_CONTENT_ID: 123,
-            },
-            True,
-        )
-    with patch.object(MockPlexServer, "fetchItem", side_effect=NotFound):
-        assert await hass.services.async_call(
-            MP_DOMAIN,
-            SERVICE_PLAY_MEDIA,
-            {
-                ATTR_ENTITY_ID: media_player_id,
-                ATTR_MEDIA_CONTENT_TYPE: DOMAIN,
-                ATTR_MEDIA_CONTENT_ID: 123,
-            },
-            True,
-        )
-
-    # TV show searches
-    with patch.object(MockPlexLibrary, "section", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_EPISODE, library_name="Not a Library", show_name="A TV Show"
-            )
-            is None
-        )
-    with patch.object(MockPlexLibrarySection, "get", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_EPISODE, library_name="TV Shows", show_name="Not a TV Show"
-            )
-            is None
-        )
-    assert (
-        loaded_server.lookup_media(
-            MEDIA_TYPE_EPISODE, library_name="TV Shows", episode_name="An Episode"
-        )
-        is None
-    )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_EPISODE, library_name="TV Shows", show_name="A TV Show"
-    )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_EPISODE,
-        library_name="TV Shows",
-        show_name="A TV Show",
-        season_number=2,
-    )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_EPISODE,
-        library_name="TV Shows",
-        show_name="A TV Show",
-        season_number=2,
-        episode_number=3,
-    )
-    with patch.object(MockPlexMediaItem, "season", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_EPISODE,
-                library_name="TV Shows",
-                show_name="A TV Show",
-                season_number=2,
-            )
-            is None
-        )
-    with patch.object(MockPlexMediaItem, "episode", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_EPISODE,
-                library_name="TV Shows",
-                show_name="A TV Show",
-                season_number=2,
-                episode_number=1,
-            )
-            is None
-        )
-
-    # Music searches
-    assert (
-        loaded_server.lookup_media(
-            MEDIA_TYPE_MUSIC, library_name="Music", album_name="An Album"
-        )
-        is None
-    )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_MUSIC, library_name="Music", artist_name="An Artist"
-    )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_MUSIC,
-        library_name="Music",
-        artist_name="An Artist",
-        track_name="A Track",
-    )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_MUSIC,
-        library_name="Music",
-        artist_name="An Artist",
-        album_name="An Album",
-    )
-    with patch.object(MockPlexLibrarySection, "get", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_MUSIC,
-                library_name="Music",
-                artist_name="Not an Artist",
-                album_name="An Album",
-            )
-            is None
-        )
-    with patch.object(MockPlexArtist, "album", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_MUSIC,
-                library_name="Music",
-                artist_name="An Artist",
-                album_name="Not an Album",
-            )
-            is None
-        )
-    with patch.object(MockPlexMediaItem, "track", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_MUSIC,
-                library_name="Music",
-                artist_name="An Artist",
-                album_name="An Album",
-                track_name="Not a Track",
-            )
-            is None
-        )
-    with patch.object(MockPlexArtist, "get", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_MUSIC,
-                library_name="Music",
-                artist_name="An Artist",
-                track_name="Not a Track",
-            )
-            is None
-        )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_MUSIC,
-        library_name="Music",
-        artist_name="An Artist",
-        album_name="An Album",
-        track_number=3,
-    )
-    assert (
-        loaded_server.lookup_media(
-            MEDIA_TYPE_MUSIC,
-            library_name="Music",
-            artist_name="An Artist",
-            album_name="An Album",
-            track_number=30,
-        )
-        is None
-    )
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_MUSIC,
-        library_name="Music",
-        artist_name="An Artist",
-        album_name="An Album",
-        track_name="A Track",
-    )
-
-    # Playlist searches
-    assert loaded_server.lookup_media(MEDIA_TYPE_PLAYLIST, playlist_name="A Playlist")
-    assert loaded_server.lookup_media(MEDIA_TYPE_PLAYLIST) is None
-    with patch.object(MockPlexServer, "playlist", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_PLAYLIST, playlist_name="Not a Playlist"
-            )
-            is None
-        )
-
-    # Movie searches
-    assert loaded_server.lookup_media(MEDIA_TYPE_VIDEO, video_name="A Movie") is None
-    assert loaded_server.lookup_media(MEDIA_TYPE_VIDEO, library_name="Movies") is None
-    assert loaded_server.lookup_media(
-        MEDIA_TYPE_VIDEO, library_name="Movies", video_name="A Movie"
-    )
-    with patch.object(MockPlexLibrarySection, "get", side_effect=NotFound):
-        assert (
-            loaded_server.lookup_media(
-                MEDIA_TYPE_VIDEO, library_name="Movies", video_name="Not a Movie"
-            )
-            is None
-        )

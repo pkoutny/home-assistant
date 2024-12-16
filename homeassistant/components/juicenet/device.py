@@ -1,9 +1,5 @@
 """Adapter to wrap the pyjuicenet api for home assistant."""
 
-import logging
-
-_LOGGER = logging.getLogger(__name__)
-
 
 class JuiceNetApi:
     """Represent a connection to JuiceNet."""
@@ -14,7 +10,7 @@ class JuiceNetApi:
         self._devices = []
 
     async def setup(self):
-        """JuiceNet device setup."""  # noqa: D403
+        """JuiceNet device setup."""
         self._devices = await self.api.get_devices()
 
     @property

@@ -1,7 +1,9 @@
 {
   "domain": "ffmpeg_motion",
   "name": "FFmpeg Motion",
-  "documentation": "https://www.home-assistant.io/integrations/ffmpeg_motion",
+  "codeowners": [],
   "dependencies": ["ffmpeg"],
-  "codeowners": []
+  "documentation": "https://www.home-assistant.io/integrations/ffmpeg_motion",
+  "iot_class": "calculated",
+  "quality_scale": "legacy"
 }

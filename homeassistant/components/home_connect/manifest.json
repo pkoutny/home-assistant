@@ -1,9 +1,11 @@
 {
   "domain": "home_connect",
   "name": "Home Connect",
+  "codeowners": ["@DavidMStraub", "@Diegorro98"],
+  "config_flow": true,
+  "dependencies": ["application_credentials"],
   "documentation": "https://www.home-assistant.io/integrations/home_connect",
-  "dependencies": ["http"],
-  "codeowners": ["@DavidMStraub"],
-  "requirements": ["homeconnect==0.5"],
-  "config_flow": true
+  "iot_class": "cloud_push",
+  "loggers": ["homeconnect"],
+  "requirements": ["homeconnect==0.8.0"]
 }

@@ -1,29 +1,39 @@
 """Support for Minut Point."""
+
 import asyncio
+from dataclasses import dataclass
+from http import HTTPStatus
 import logging
 
+from aiohttp import ClientError, ClientResponseError, web
 from pypoint import PointSession
 import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components import webhook
+from homeassistant.components.application_credentials import (
+    ClientCredential,
+    async_import_client_credential,
+)
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
-    CONF_TOKEN,
     CONF_WEBHOOK_ID,
+    Platform,
 )
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.dispatcher import (
-    async_dispatcher_connect,
-    async_dispatcher_send,
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import (
+    aiohttp_client,
+    config_entry_oauth2_flow,
+    config_validation as cv,
 )
-from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.typing import HomeAssistantType
-from homeassistant.util.dt import as_local, parse_datetime, utc_from_timestamp
+from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
+from homeassistant.helpers.typing import ConfigType
 
-from . import config_flow
+from . import api
 from .const import (
     CONF_WEBHOOK_URL,
     DOMAIN,
@@ -36,8 +46,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_CONFIG_ENTRY_LOCK = "point_config_entry_lock"
-CONFIG_ENTRY_IS_SETUP = "point_config_entry_is_setup"
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+
+type PointConfigEntry = ConfigEntry[PointData]
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -52,65 +63,94 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Minut Point component."""
     if DOMAIN not in config:
         return True
 
     conf = config[DOMAIN]
 
-    config_flow.register_flow_implementation(
-        hass, DOMAIN, conf[CONF_CLIENT_ID], conf[CONF_CLIENT_SECRET]
+    async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        breaks_in_ha_version="2025.4.0",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "Point",
+        },
     )
 
-    hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": config_entries.SOURCE_IMPORT}
+    if not hass.config_entries.async_entries(DOMAIN):
+        await async_import_client_credential(
+            hass,
+            DOMAIN,
+            ClientCredential(
+                conf[CONF_CLIENT_ID],
+                conf[CONF_CLIENT_SECRET],
+            ),
         )
-    )
+
+        hass.async_create_task(
+            hass.config_entries.flow.async_init(
+                DOMAIN, context={"source": SOURCE_IMPORT}, data=conf
+            )
+        )
 
     return True
 
 
-async def async_setup_entry(hass: HomeAssistantType, entry: ConfigEntry):
-    """Set up Point from a config entry."""
+async def async_setup_entry(hass: HomeAssistant, entry: PointConfigEntry) -> bool:
+    """Set up Minut Point from a config entry."""
 
-    def token_saver(token):
-        _LOGGER.debug("Saving updated token")
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_TOKEN: token}
+    if "auth_implementation" not in entry.data:
+        raise ConfigEntryAuthFailed("Authentication failed. Please re-authenticate.")
+
+    implementation = (
+        await config_entry_oauth2_flow.async_get_config_entry_implementation(
+            hass, entry
         )
-
-    # Force token update.
-    entry.data[CONF_TOKEN]["expires_in"] = -1
-    session = PointSession(
-        entry.data["refresh_args"][CONF_CLIENT_ID],
-        token=entry.data[CONF_TOKEN],
-        auto_refresh_kwargs=entry.data["refresh_args"],
-        token_saver=token_saver,
+    )
+    session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
+    auth = api.AsyncConfigEntryAuth(
+        aiohttp_client.async_get_clientsession(hass), session
     )
 
-    if not session.is_authorized:
-        _LOGGER.error("Authentication Error")
-        return False
+    try:
+        await auth.async_get_access_token()
+    except ClientResponseError as err:
+        if err.status in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
+            raise ConfigEntryAuthFailed from err
+        raise ConfigEntryNotReady from err
+    except ClientError as err:
+        raise ConfigEntryNotReady from err
 
-    hass.data[DATA_CONFIG_ENTRY_LOCK] = asyncio.Lock()
-    hass.data[CONFIG_ENTRY_IS_SETUP] = set()
+    point_session = PointSession(auth)
 
-    await async_setup_webhook(hass, entry, session)
-    client = MinutPointClient(hass, entry, session)
-    hass.data.setdefault(DOMAIN, {}).update({entry.entry_id: client})
+    client = MinutPointClient(hass, entry, point_session)
     hass.async_create_task(client.update())
+    entry.runtime_data = PointData(client)
+
+    await async_setup_webhook(hass, entry, point_session)
+    await hass.config_entries.async_forward_entry_setups(
+        entry, [*PLATFORMS, Platform.ALARM_CONTROL_PANEL]
+    )
 
     return True
 
 
-async def async_setup_webhook(hass: HomeAssistantType, entry: ConfigEntry, session):
+async def async_setup_webhook(
+    hass: HomeAssistant, entry: PointConfigEntry, session: PointSession
+) -> None:
     """Set up a webhook to handle binary sensor events."""
     if CONF_WEBHOOK_ID not in entry.data:
-        webhook_id = hass.components.webhook.async_generate_id()
-        webhook_url = hass.components.webhook.async_generate_url(webhook_id)
-        _LOGGER.info("Registering new webhook at: %s", webhook_url)
+        webhook_id = webhook.async_generate_id()
+        webhook_url = webhook.async_generate_url(hass, webhook_id)
+        _LOGGER.debug("Registering new webhook at: %s", webhook_url)
 
         hass.config_entries.async_update_entry(
             entry,
@@ -120,40 +160,38 @@ async def async_setup_webhook(hass: HomeAssistantType, entry: ConfigEntry, sessi
                 CONF_WEBHOOK_URL: webhook_url,
             },
         )
-    await hass.async_add_executor_job(
-        session.update_webhook,
-        entry.data[CONF_WEBHOOK_URL],
+
+    await session.update_webhook(
+        webhook.async_generate_url(hass, entry.data[CONF_WEBHOOK_ID]),
         entry.data[CONF_WEBHOOK_ID],
         ["*"],
     )
-
-    hass.components.webhook.async_register(
-        DOMAIN, "Point", entry.data[CONF_WEBHOOK_ID], handle_webhook
+    webhook.async_register(
+        hass, DOMAIN, "Point", entry.data[CONF_WEBHOOK_ID], handle_webhook
     )
 
 
-async def async_unload_entry(hass: HomeAssistantType, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: PointConfigEntry) -> bool:
     """Unload a config entry."""
-    hass.components.webhook.async_unregister(entry.data[CONF_WEBHOOK_ID])
-    session = hass.data[DOMAIN].pop(entry.entry_id)
-    await hass.async_add_executor_job(session.remove_webhook)
-
-    if not hass.data[DOMAIN]:
-        hass.data.pop(DOMAIN)
-
-    for component in ("binary_sensor", "sensor"):
-        await hass.config_entries.async_forward_entry_unload(entry, component)
-
-    return True
+    if unload_ok := await hass.config_entries.async_unload_platforms(
+        entry, [*PLATFORMS, Platform.ALARM_CONTROL_PANEL]
+    ):
+        session: PointSession = entry.runtime_data.client
+        if CONF_WEBHOOK_ID in entry.data:
+            webhook.async_unregister(hass, entry.data[CONF_WEBHOOK_ID])
+            await session.remove_webhook()
+    return unload_ok
 
 
-async def handle_webhook(hass, webhook_id, request):
+async def handle_webhook(
+    hass: HomeAssistant, webhook_id: str, request: web.Request
+) -> None:
     """Handle webhook callback."""
     try:
         data = await request.json()
         _LOGGER.debug("Webhook %s: %s", webhook_id, data)
     except ValueError:
-        return None
+        return
 
     if isinstance(data, dict):
         data["webhook_id"] = webhook_id
@@ -164,10 +202,12 @@ async def handle_webhook(hass, webhook_id, request):
 class MinutPointClient:
     """Get the latest data and update the states."""
 
-    def __init__(self, hass: HomeAssistantType, config_entry: ConfigEntry, session):
+    def __init__(
+        self, hass: HomeAssistant, config_entry: ConfigEntry, session: PointSession
+    ) -> None:
         """Initialize the Minut data object."""
-        self._known_devices = set()
-        self._known_homes = set()
+        self._known_devices: set[str] = set()
+        self._known_homes: set[str] = set()
         self._hass = hass
         self._config_entry = config_entry
         self._is_available = True
@@ -181,37 +221,29 @@ class MinutPointClient:
 
     async def _sync(self):
         """Update local list of devices."""
-        if (
-            not await self._hass.async_add_executor_job(self._client.update)
-            and self._is_available
-        ):
+        if not await self._client.update():
             self._is_available = False
             _LOGGER.warning("Device is unavailable")
+            async_dispatcher_send(self._hass, SIGNAL_UPDATE_ENTITY)
             return
-
-        async def new_device(device_id, component):
-            """Load new device."""
-            config_entries_key = f"{component}.{DOMAIN}"
-            async with self._hass.data[DATA_CONFIG_ENTRY_LOCK]:
-                if config_entries_key not in self._hass.data[CONFIG_ENTRY_IS_SETUP]:
-                    await self._hass.config_entries.async_forward_entry_setup(
-                        self._config_entry, component
-                    )
-                    self._hass.data[CONFIG_ENTRY_IS_SETUP].add(config_entries_key)
-
-            async_dispatcher_send(
-                self._hass, POINT_DISCOVERY_NEW.format(component, DOMAIN), device_id
-            )
 
         self._is_available = True
         for home_id in self._client.homes:
             if home_id not in self._known_homes:
-                await new_device(home_id, "alarm_control_panel")
+                async_dispatcher_send(
+                    self._hass,
+                    POINT_DISCOVERY_NEW.format(Platform.ALARM_CONTROL_PANEL),
+                    home_id,
+                )
                 self._known_homes.add(home_id)
         for device in self._client.devices:
             if device.device_id not in self._known_devices:
-                for component in ("sensor", "binary_sensor"):
-                    await new_device(device.device_id, component)
+                for platform in PLATFORMS:
+                    async_dispatcher_send(
+                        self._hass,
+                        POINT_DISCOVERY_NEW.format(platform),
+                        device.device_id,
+                    )
                 self._known_devices.add(device.device_id)
         async_dispatcher_send(self._hass, SIGNAL_UPDATE_ENTITY)
 
@@ -221,129 +253,31 @@ class MinutPointClient:
 
     def is_available(self, device_id):
         """Return device availability."""
+        if not self._is_available:
+            return False
         return device_id in self._client.device_ids
 
-    def remove_webhook(self):
+    async def remove_webhook(self):
         """Remove the session webhook."""
-        return self._client.remove_webhook()
+        return await self._client.remove_webhook()
 
     @property
     def homes(self):
         """Return known homes."""
         return self._client.homes
 
-    def alarm_disarm(self, home_id):
+    async def async_alarm_disarm(self, home_id):
         """Send alarm disarm command."""
-        return self._client.alarm_disarm(home_id)
+        return await self._client.alarm_disarm(home_id)
 
-    def alarm_arm(self, home_id):
+    async def async_alarm_arm(self, home_id):
         """Send alarm arm command."""
-        return self._client.alarm_arm(home_id)
+        return await self._client.alarm_arm(home_id)
 
 
-class MinutPointEntity(Entity):
-    """Base Entity used by the sensors."""
+@dataclass
+class PointData:
+    """Point Data."""
 
-    def __init__(self, point_client, device_id, device_class):
-        """Initialize the entity."""
-        self._async_unsub_dispatcher_connect = None
-        self._client = point_client
-        self._id = device_id
-        self._name = self.device.name
-        self._device_class = device_class
-        self._updated = utc_from_timestamp(0)
-        self._value = None
-
-    def __str__(self):
-        """Return string representation of device."""
-        return f"MinutPoint {self.name}"
-
-    async def async_added_to_hass(self):
-        """Call when entity is added to hass."""
-        _LOGGER.debug("Created device %s", self)
-        self._async_unsub_dispatcher_connect = async_dispatcher_connect(
-            self.hass, SIGNAL_UPDATE_ENTITY, self._update_callback
-        )
-        await self._update_callback()
-
-    async def async_will_remove_from_hass(self):
-        """Disconnect dispatcher listener when removed."""
-        if self._async_unsub_dispatcher_connect:
-            self._async_unsub_dispatcher_connect()
-
-    async def _update_callback(self):
-        """Update the value of the sensor."""
-
-    @property
-    def available(self):
-        """Return true if device is not offline."""
-        return self._client.is_available(self.device_id)
-
-    @property
-    def device(self):
-        """Return the representation of the device."""
-        return self._client.device(self.device_id)
-
-    @property
-    def device_class(self):
-        """Return the device class."""
-        return self._device_class
-
-    @property
-    def device_id(self):
-        """Return the id of the device."""
-        return self._id
-
-    @property
-    def device_state_attributes(self):
-        """Return status of device."""
-        attrs = self.device.device_status
-        attrs["last_heard_from"] = as_local(self.last_update).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        return attrs
-
-    @property
-    def device_info(self):
-        """Return a device description for device registry."""
-        device = self.device.device
-        return {
-            "connections": {("mac", device["device_mac"])},
-            "identifieres": device["device_id"],
-            "manufacturer": "Minut",
-            "model": f"Point v{device['hardware_version']}",
-            "name": device["description"],
-            "sw_version": device["firmware"]["installed"],
-            "via_device": (DOMAIN, device["home"]),
-        }
-
-    @property
-    def name(self):
-        """Return the display name of this device."""
-        return f"{self._name} {self.device_class.capitalize()}"
-
-    @property
-    def is_updated(self):
-        """Return true if sensor have been updated."""
-        return self.last_update > self._updated
-
-    @property
-    def last_update(self):
-        """Return the last_update time for the device."""
-        last_update = parse_datetime(self.device.last_update)
-        return last_update
-
-    @property
-    def should_poll(self):
-        """No polling needed for point."""
-        return False
-
-    @property
-    def unique_id(self):
-        """Return the unique id of the sensor."""
-        return f"point.{self._id}-{self.device_class}"
-
-    @property
-    def value(self):
-        """Return the sensor value."""
-        return self._value
+    client: MinutPointClient
+    entry_lock: asyncio.Lock = asyncio.Lock()

@@ -1,9 +1,14 @@
 """Constants for the Plex component."""
-from homeassistant.const import __version__
+
+from datetime import timedelta
+from typing import Final
+
+from homeassistant.const import Platform, __version__
 
 DOMAIN = "plex"
 NAME_FORMAT = "Plex ({})"
 COMMON_PLAYERS = ["Plex Web"]
+TRANSIENT_DEVICE_MODELS = ["Plex Web", "Plex for Sonos"]
 
 DEFAULT_PORT = 32400
 DEFAULT_SSL = False
@@ -11,17 +16,24 @@ DEFAULT_VERIFY_SSL = True
 
 PLEXTV_THROTTLE = 60
 
+CLIENT_SCAN_INTERVAL = timedelta(minutes=10)
 DEBOUNCE_TIMEOUT = 1
-DISPATCHERS = "dispatchers"
-PLATFORMS = frozenset(["media_player", "sensor"])
-PLATFORMS_COMPLETED = "platforms_completed"
-SERVERS = "servers"
-WEBSOCKETS = "websockets"
+DISPATCHERS: Final = "dispatchers"
+GDM_DEBOUNCER: Final = "gdm_debouncer"
+GDM_SCANNER: Final = "gdm_scanner"
+PLATFORMS = frozenset(
+    [Platform.BUTTON, Platform.MEDIA_PLAYER, Platform.SENSOR, Platform.UPDATE]
+)
+PLAYER_SOURCE = "player_source"
+SERVERS: Final = "servers"
+WEBSOCKETS: Final = "websockets"
 
 PLEX_SERVER_CONFIG = "server_config"
 
 PLEX_NEW_MP_SIGNAL = "plex_new_mp_signal.{}"
+PLEX_UPDATE_MEDIA_PLAYER_SESSION_SIGNAL = "plex_update_session_signal.{}"
 PLEX_UPDATE_MEDIA_PLAYER_SIGNAL = "plex_update_mp_signal.{}"
+PLEX_UPDATE_LIBRARY_SIGNAL = "plex_update_libraries_signal.{}"
 PLEX_UPDATE_PLATFORMS_SIGNAL = "plex_update_platforms_signal.{}"
 PLEX_UPDATE_SENSOR_SIGNAL = "plex_update_sensor_signal.{}"
 
@@ -43,4 +55,9 @@ X_PLEX_VERSION = __version__
 AUTOMATIC_SETUP_STRING = "Obtain a new token from plex.tv"
 MANUAL_SETUP_STRING = "Configure Plex server manually"
 
-SERVICE_PLAY_ON_SONOS = "play_on_sonos"
+SERVICE_REFRESH_LIBRARY = "refresh_library"
+SERVICE_SCAN_CLIENTS = "scan_for_clients"
+
+PLEX_URI_SCHEME = "plex://"
+
+INVALID_TOKEN_MESSAGE = "Invalid token"

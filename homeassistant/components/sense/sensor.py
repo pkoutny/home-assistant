@@ -1,362 +1,282 @@
 """Support for monitoring a Sense energy sensor."""
-import logging
 
-from homeassistant.const import (
-    ATTR_ATTRIBUTION,
-    DEVICE_CLASS_POWER,
-    ENERGY_KILO_WATT_HOUR,
-    POWER_WATT,
+from datetime import datetime
+
+from sense_energy import ASyncSenseable, Scale
+from sense_energy.sense_api import SenseDevice
+
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
 )
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import Entity
+from homeassistant.const import (
+    PERCENTAGE,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfPower,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from . import SenseConfigEntry
 from .const import (
-    ACTIVE_NAME,
     ACTIVE_TYPE,
-    ATTRIBUTION,
     CONSUMPTION_ID,
     CONSUMPTION_NAME,
-    DOMAIN,
-    ICON,
-    MDI_ICONS,
+    FROM_GRID_ID,
+    FROM_GRID_NAME,
+    NET_PRODUCTION_ID,
+    NET_PRODUCTION_NAME,
     PRODUCTION_ID,
     PRODUCTION_NAME,
-    SENSE_DATA,
-    SENSE_DEVICE_UPDATE,
-    SENSE_DEVICES_DATA,
-    SENSE_DISCOVERED_DEVICES_DATA,
-    SENSE_TRENDS_COORDINATOR,
+    PRODUCTION_PCT_ID,
+    PRODUCTION_PCT_NAME,
+    SOLAR_POWERED_ID,
+    SOLAR_POWERED_NAME,
+    TO_GRID_ID,
+    TO_GRID_NAME,
 )
-
-_LOGGER = logging.getLogger(__name__)
-
-
-class SensorConfig:
-    """Data structure holding sensor configuration."""
-
-    def __init__(self, name, sensor_type):
-        """Sensor name and type to pass to API."""
-        self.name = name
-        self.sensor_type = sensor_type
-
-
-# Sensor types/ranges
-ACTIVE_SENSOR_TYPE = SensorConfig(ACTIVE_NAME, ACTIVE_TYPE)
+from .coordinator import SenseRealtimeCoordinator, SenseTrendCoordinator
+from .entity import SenseDeviceEntity, SenseEntity
 
 # Sensor types/ranges
 TRENDS_SENSOR_TYPES = {
-    "daily": SensorConfig("Daily", "DAY"),
-    "weekly": SensorConfig("Weekly", "WEEK"),
-    "monthly": SensorConfig("Monthly", "MONTH"),
-    "yearly": SensorConfig("Yearly", "YEAR"),
+    Scale.DAY: "Daily",
+    Scale.WEEK: "Weekly",
+    Scale.MONTH: "Monthly",
+    Scale.YEAR: "Yearly",
+    Scale.CYCLE: "Bill",
 }
 
 # Production/consumption variants
-SENSOR_VARIANTS = [PRODUCTION_ID, CONSUMPTION_ID]
+SENSOR_VARIANTS = [(PRODUCTION_ID, PRODUCTION_NAME), (CONSUMPTION_ID, CONSUMPTION_NAME)]
+
+# Trend production/consumption variants
+TREND_SENSOR_VARIANTS = [
+    *SENSOR_VARIANTS,
+    (PRODUCTION_PCT_ID, PRODUCTION_PCT_NAME),
+    (NET_PRODUCTION_ID, NET_PRODUCTION_NAME),
+    (FROM_GRID_ID, FROM_GRID_NAME),
+    (TO_GRID_ID, TO_GRID_NAME),
+    (SOLAR_POWERED_ID, SOLAR_POWERED_NAME),
+]
 
 
-def sense_to_mdi(sense_icon):
-    """Convert sense icon to mdi icon."""
-    return "mdi:{}".format(MDI_ICONS.get(sense_icon, "power-plug"))
-
-
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: SenseConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
     """Set up the Sense sensor."""
-    data = hass.data[DOMAIN][config_entry.entry_id][SENSE_DATA]
-    sense_devices_data = hass.data[DOMAIN][config_entry.entry_id][SENSE_DEVICES_DATA]
-    trends_coordinator = hass.data[DOMAIN][config_entry.entry_id][
-        SENSE_TRENDS_COORDINATOR
-    ]
+    data = config_entry.runtime_data.data
+    trends_coordinator = config_entry.runtime_data.trends
+    realtime_coordinator = config_entry.runtime_data.rt
 
     # Request only in case it takes longer
     # than 60s
     await trends_coordinator.async_request_refresh()
 
     sense_monitor_id = data.sense_monitor_id
-    sense_devices = hass.data[DOMAIN][config_entry.entry_id][
-        SENSE_DISCOVERED_DEVICES_DATA
-    ]
 
-    devices = [
-        SenseEnergyDevice(sense_devices_data, device, sense_monitor_id)
-        for device in sense_devices
-        if device["tags"]["DeviceListAllowed"] == "true"
-    ]
+    entities: list[SensorEntity] = []
 
-    for var in SENSOR_VARIANTS:
-        name = ACTIVE_SENSOR_TYPE.name
-        sensor_type = ACTIVE_SENSOR_TYPE.sensor_type
-        is_production = var == PRODUCTION_ID
+    for device in config_entry.runtime_data.data.devices:
+        entities.append(
+            SenseDevicePowerSensor(device, sense_monitor_id, realtime_coordinator)
+        )
+        entities.extend(
+            SenseDeviceEnergySensor(device, scale, trends_coordinator, sense_monitor_id)
+            for scale in Scale
+        )
 
-        unique_id = f"{sense_monitor_id}-active-{var}"
-        devices.append(
-            SenseActiveSensor(
-                data, name, sensor_type, is_production, sense_monitor_id, var, unique_id
+    for variant_id, variant_name in SENSOR_VARIANTS:
+        entities.append(
+            SensePowerSensor(
+                data, sense_monitor_id, variant_id, variant_name, realtime_coordinator
             )
         )
 
-    for type_id in TRENDS_SENSOR_TYPES:
-        typ = TRENDS_SENSOR_TYPES[type_id]
-        for var in SENSOR_VARIANTS:
-            name = typ.name
-            sensor_type = typ.sensor_type
-            is_production = var == PRODUCTION_ID
+    entities.extend(
+        SenseVoltageSensor(data, i, sense_monitor_id, realtime_coordinator)
+        for i in range(len(data.active_voltage))
+    )
 
-            unique_id = f"{sense_monitor_id}-{type_id}-{var}"
-            devices.append(
+    for scale in Scale:
+        for variant_id, variant_name in TREND_SENSOR_VARIANTS:
+            entities.append(
                 SenseTrendsSensor(
                     data,
-                    name,
-                    sensor_type,
-                    is_production,
+                    scale,
+                    variant_id,
+                    variant_name,
                     trends_coordinator,
-                    unique_id,
+                    sense_monitor_id,
                 )
             )
 
-    async_add_entities(devices)
+    async_add_entities(entities)
 
 
-class SenseActiveSensor(Entity):
+class SensePowerSensor(SenseEntity, SensorEntity):
+    """Implementation of a Sense energy sensor."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        gateway: ASyncSenseable,
+        sense_monitor_id: str,
+        variant_id: str,
+        variant_name: str,
+        realtime_coordinator: SenseRealtimeCoordinator,
+    ) -> None:
+        """Initialize the Sense sensor."""
+        super().__init__(
+            gateway,
+            realtime_coordinator,
+            sense_monitor_id,
+            f"{ACTIVE_TYPE}-{variant_id}",
+        )
+        self._attr_name = variant_name
+        self._variant_id = variant_id
+
+    @property
+    def native_value(self) -> float:
+        """Return the state of the sensor."""
+        return round(
+            self._gateway.active_solar_power
+            if self._variant_id == PRODUCTION_ID
+            else self._gateway.active_power
+        )
+
+
+class SenseVoltageSensor(SenseEntity, SensorEntity):
+    """Implementation of a Sense energy voltage sensor."""
+
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+
+    def __init__(
+        self,
+        gateway: ASyncSenseable,
+        index: int,
+        sense_monitor_id: str,
+        realtime_coordinator: SenseRealtimeCoordinator,
+    ) -> None:
+        """Initialize the Sense sensor."""
+        super().__init__(
+            gateway, realtime_coordinator, sense_monitor_id, f"L{index + 1}"
+        )
+        self._attr_name = f"L{index + 1} Voltage"
+        self._voltage_index = index
+
+    @property
+    def native_value(self) -> float:
+        """Return the state of the sensor."""
+        return round(self._gateway.active_voltage[self._voltage_index], 1)
+
+
+class SenseTrendsSensor(SenseEntity, SensorEntity):
     """Implementation of a Sense energy sensor."""
 
     def __init__(
         self,
-        data,
-        name,
-        sensor_type,
-        is_production,
-        sense_monitor_id,
-        sensor_id,
-        unique_id,
-    ):
+        gateway: ASyncSenseable,
+        scale: Scale,
+        variant_id: str,
+        variant_name: str,
+        trends_coordinator: SenseTrendCoordinator,
+        sense_monitor_id: str,
+    ) -> None:
         """Initialize the Sense sensor."""
-        name_type = PRODUCTION_NAME if is_production else CONSUMPTION_NAME
-        self._name = f"{name} {name_type}"
-        self._unique_id = unique_id
-        self._available = False
-        self._data = data
-        self._sense_monitor_id = sense_monitor_id
-        self._sensor_type = sensor_type
-        self._is_production = is_production
-        self._state = None
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def state(self):
-        """Return the state of the sensor."""
-        return self._state
-
-    @property
-    def available(self):
-        """Return the availability of the sensor."""
-        return self._available
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement of this entity, if any."""
-        return POWER_WATT
-
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes."""
-        return {ATTR_ATTRIBUTION: ATTRIBUTION}
-
-    @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return ICON
-
-    @property
-    def unique_id(self):
-        """Return the unique id."""
-        return self._unique_id
-
-    @property
-    def should_poll(self):
-        """Return the device should not poll for updates."""
-        return False
-
-    async def async_added_to_hass(self):
-        """Register callbacks."""
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{SENSE_DEVICE_UPDATE}-{self._sense_monitor_id}",
-                self._async_update_from_data,
-            )
+        super().__init__(
+            gateway,
+            trends_coordinator,
+            sense_monitor_id,
+            f"{TRENDS_SENSOR_TYPES[scale].lower()}-{variant_id}",
         )
-
-    @callback
-    def _async_update_from_data(self):
-        """Update the sensor from the data. Must not do I/O."""
-        self._state = round(
-            self._data.active_solar_power
-            if self._is_production
-            else self._data.active_power
-        )
-        self._available = True
-        self.async_write_ha_state()
-
-
-class SenseTrendsSensor(Entity):
-    """Implementation of a Sense energy sensor."""
-
-    def __init__(
-        self, data, name, sensor_type, is_production, trends_coordinator, unique_id,
-    ):
-        """Initialize the Sense sensor."""
-        name_type = PRODUCTION_NAME if is_production else CONSUMPTION_NAME
-        self._name = f"{name} {name_type}"
-        self._unique_id = unique_id
-        self._available = False
-        self._data = data
-        self._sensor_type = sensor_type
-        self._coordinator = trends_coordinator
-        self._is_production = is_production
-        self._state = None
-        self._unit_of_measurement = ENERGY_KILO_WATT_HOUR
+        self._attr_name = f"{TRENDS_SENSOR_TYPES[scale]} {variant_name}"
+        self._scale = scale
+        self._variant_id = variant_id
         self._had_any_update = False
+        if variant_id in [PRODUCTION_PCT_ID, SOLAR_POWERED_ID]:
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_entity_registry_enabled_default = False
+            self._attr_state_class = None
+            self._attr_device_class = None
+        else:
+            self._attr_device_class = SensorDeviceClass.ENERGY
+            self._attr_state_class = SensorStateClass.TOTAL
+            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def state(self):
+    def native_value(self) -> float:
         """Return the state of the sensor."""
-        return round(self._data.get_trend(self._sensor_type, self._is_production), 1)
+        return round(self._gateway.get_stat(self._scale, self._variant_id), 1)
 
     @property
-    def available(self):
-        """Return if entity is available."""
-        return self._had_any_update and self._coordinator.last_update_success
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement of this entity, if any."""
-        return self._unit_of_measurement
-
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes."""
-        return {ATTR_ATTRIBUTION: ATTRIBUTION}
-
-    @property
-    def icon(self):
-        """Icon to use in the frontend, if any."""
-        return ICON
-
-    @property
-    def unique_id(self):
-        """Return the unique id."""
-        return self._unique_id
-
-    @property
-    def should_poll(self):
-        """No need to poll. Coordinator notifies entity of updates."""
-        return False
-
-    @callback
-    def _async_update(self):
-        """Track if we had an update so we do not report zero data."""
-        self._had_any_update = True
-        self.async_write_ha_state()
-
-    async def async_update(self):
-        """Update the entity.
-
-        Only used by the generic entity update service.
-        """
-        await self._coordinator.async_request_refresh()
-
-    async def async_added_to_hass(self):
-        """When entity is added to hass."""
-        self.async_on_remove(self._coordinator.async_add_listener(self._async_update))
+    def last_reset(self) -> datetime | None:
+        """Return the time when the sensor was last reset, if any."""
+        if self._attr_state_class == SensorStateClass.TOTAL:
+            return self._gateway.trend_start(self._scale)
+        return None
 
 
-class SenseEnergyDevice(Entity):
+class SenseDevicePowerSensor(SenseDeviceEntity, SensorEntity):
     """Implementation of a Sense energy device."""
 
-    def __init__(self, sense_devices_data, device, sense_monitor_id):
-        """Initialize the Sense binary sensor."""
-        self._name = f"{device['name']} {CONSUMPTION_NAME}"
-        self._id = device["id"]
-        self._available = False
-        self._sense_monitor_id = sense_monitor_id
-        self._unique_id = f"{sense_monitor_id}-{self._id}-{CONSUMPTION_ID}"
-        self._icon = sense_to_mdi(device["icon"])
-        self._sense_devices_data = sense_devices_data
-        self._state = None
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
 
-    @property
-    def state(self):
-        """Return the wattage of the sensor."""
-        return self._state
-
-    @property
-    def available(self):
-        """Return the availability of the sensor."""
-        return self._available
-
-    @property
-    def name(self):
-        """Return the name of the power sensor."""
-        return self._name
-
-    @property
-    def unique_id(self):
-        """Return the unique id of the power sensor."""
-        return self._unique_id
-
-    @property
-    def icon(self):
-        """Return the icon of the power sensor."""
-        return self._icon
-
-    @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement of this entity."""
-        return POWER_WATT
-
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes."""
-        return {ATTR_ATTRIBUTION: ATTRIBUTION}
-
-    @property
-    def device_class(self):
-        """Return the device class of the power sensor."""
-        return DEVICE_CLASS_POWER
-
-    @property
-    def should_poll(self):
-        """Return the device should not poll for updates."""
-        return False
-
-    async def async_added_to_hass(self):
-        """Register callbacks."""
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{SENSE_DEVICE_UPDATE}-{self._sense_monitor_id}",
-                self._async_update_from_data,
-            )
+    def __init__(
+        self,
+        device: SenseDevice,
+        sense_monitor_id: str,
+        coordinator: SenseRealtimeCoordinator,
+    ) -> None:
+        """Initialize the Sense device sensor."""
+        super().__init__(
+            device, coordinator, sense_monitor_id, f"{device.id}-{CONSUMPTION_ID}"
         )
 
-    @callback
-    def _async_update_from_data(self):
-        """Get the latest data, update state. Must not do I/O."""
-        device_data = self._sense_devices_data.get_device_by_id(self._id)
-        if not device_data or "w" not in device_data:
-            self._state = 0
-        else:
-            self._state = int(device_data["w"])
-        self._available = True
-        self.async_write_ha_state()
+    @property
+    def native_value(self) -> float:
+        """Return the state of the sensor."""
+        return self._device.power_w
+
+
+class SenseDeviceEnergySensor(SenseDeviceEntity, SensorEntity):
+    """Implementation of a Sense device energy sensor."""
+
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_device_class = SensorDeviceClass.ENERGY
+
+    def __init__(
+        self,
+        device: SenseDevice,
+        scale: Scale,
+        coordinator: SenseTrendCoordinator,
+        sense_monitor_id: str,
+    ) -> None:
+        """Initialize the Sense device sensor."""
+        super().__init__(
+            device,
+            coordinator,
+            sense_monitor_id,
+            f"{device.id}-{TRENDS_SENSOR_TYPES[scale].lower()}-energy",
+        )
+        self._attr_translation_key = f"{TRENDS_SENSOR_TYPES[scale].lower()}_energy"
+        self._attr_suggested_display_precision = 2
+        self._scale = scale
+        self._device = device
+
+    @property
+    def native_value(self) -> float:
+        """Return the state of the sensor."""
+        return self._device.energy_kwh[self._scale]

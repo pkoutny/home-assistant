@@ -1,8 +1,12 @@
 """The tests for the DirecTV Media player platform."""
-from datetime import datetime, timedelta
-from typing import Optional
 
-from pytest import fixture
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from unittest.mock import patch
+
+from freezegun.api import FrozenDateTimeFactory
+import pytest
 
 from homeassistant.components.directv.media_player import (
     ATTR_MEDIA_CURRENTLY_RECORDING,
@@ -10,7 +14,7 @@ from homeassistant.components.directv.media_player import (
     ATTR_MEDIA_RECORDED,
     ATTR_MEDIA_START_TIME,
 )
-from homeassistant.components.media_player.const import (
+from homeassistant.components.media_player import (
     ATTR_INPUT_SOURCE,
     ATTR_MEDIA_ALBUM_NAME,
     ATTR_MEDIA_ARTIST,
@@ -24,18 +28,10 @@ from homeassistant.components.media_player.const import (
     ATTR_MEDIA_SERIES_TITLE,
     ATTR_MEDIA_TITLE,
     DOMAIN as MP_DOMAIN,
-    MEDIA_TYPE_MOVIE,
-    MEDIA_TYPE_MUSIC,
-    MEDIA_TYPE_TVSHOW,
     SERVICE_PLAY_MEDIA,
-    SUPPORT_NEXT_TRACK,
-    SUPPORT_PAUSE,
-    SUPPORT_PLAY,
-    SUPPORT_PLAY_MEDIA,
-    SUPPORT_PREVIOUS_TRACK,
-    SUPPORT_STOP,
-    SUPPORT_TURN_OFF,
-    SUPPORT_TURN_ON,
+    MediaPlayerDeviceClass,
+    MediaPlayerEntityFeature,
+    MediaType,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -51,11 +47,12 @@ from homeassistant.const import (
     STATE_PLAYING,
     STATE_UNAVAILABLE,
 )
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
-from tests.async_mock import patch
-from tests.components.directv import setup_integration
+from . import setup_integration
+
 from tests.test_util.aiohttp import AiohttpClientMocker
 
 ATTR_UNIQUE_ID = "unique_id"
@@ -66,57 +63,45 @@ RESTRICTED_ENTITY_ID = f"{MP_DOMAIN}.restricted_client"
 STANDBY_ENTITY_ID = f"{MP_DOMAIN}.standby_client"
 UNAVAILABLE_ENTITY_ID = f"{MP_DOMAIN}.unavailable_client"
 
-# pylint: disable=redefined-outer-name
 
-
-@fixture
+@pytest.fixture
 def mock_now() -> datetime:
     """Fixture for dtutil.now."""
     return dt_util.utcnow()
 
 
-async def async_turn_on(
-    hass: HomeAssistantType, entity_id: Optional[str] = None
-) -> None:
+async def async_turn_on(hass: HomeAssistant, entity_id: str | None = None) -> None:
     """Turn on specified media player or all."""
     data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
     await hass.services.async_call(MP_DOMAIN, SERVICE_TURN_ON, data)
 
 
-async def async_turn_off(
-    hass: HomeAssistantType, entity_id: Optional[str] = None
-) -> None:
+async def async_turn_off(hass: HomeAssistant, entity_id: str | None = None) -> None:
     """Turn off specified media player or all."""
     data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
     await hass.services.async_call(MP_DOMAIN, SERVICE_TURN_OFF, data)
 
 
-async def async_media_pause(
-    hass: HomeAssistantType, entity_id: Optional[str] = None
-) -> None:
+async def async_media_pause(hass: HomeAssistant, entity_id: str | None = None) -> None:
     """Send the media player the command for pause."""
     data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
     await hass.services.async_call(MP_DOMAIN, SERVICE_MEDIA_PAUSE, data)
 
 
-async def async_media_play(
-    hass: HomeAssistantType, entity_id: Optional[str] = None
-) -> None:
+async def async_media_play(hass: HomeAssistant, entity_id: str | None = None) -> None:
     """Send the media player the command for play/pause."""
     data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
     await hass.services.async_call(MP_DOMAIN, SERVICE_MEDIA_PLAY, data)
 
 
-async def async_media_stop(
-    hass: HomeAssistantType, entity_id: Optional[str] = None
-) -> None:
+async def async_media_stop(hass: HomeAssistant, entity_id: str | None = None) -> None:
     """Send the media player the command for stop."""
     data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
     await hass.services.async_call(MP_DOMAIN, SERVICE_MEDIA_STOP, data)
 
 
 async def async_media_next_track(
-    hass: HomeAssistantType, entity_id: Optional[str] = None
+    hass: HomeAssistant, entity_id: str | None = None
 ) -> None:
     """Send the media player the command for next track."""
     data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
@@ -124,7 +109,7 @@ async def async_media_next_track(
 
 
 async def async_media_previous_track(
-    hass: HomeAssistantType, entity_id: Optional[str] = None
+    hass: HomeAssistant, entity_id: str | None = None
 ) -> None:
     """Send the media player the command for prev track."""
     data = {ATTR_ENTITY_ID: entity_id} if entity_id else {}
@@ -132,11 +117,11 @@ async def async_media_previous_track(
 
 
 async def async_play_media(
-    hass: HomeAssistantType,
+    hass: HomeAssistant,
     media_type: str,
     media_id: str,
-    entity_id: Optional[str] = None,
-    enqueue: Optional[str] = None,
+    entity_id: str | None = None,
+    enqueue: str | None = None,
 ) -> None:
     """Send the media player the command for playing media."""
     data = {ATTR_MEDIA_CONTENT_TYPE: media_type, ATTR_MEDIA_CONTENT_ID: media_id}
@@ -150,9 +135,7 @@ async def async_play_media(
     await hass.services.async_call(MP_DOMAIN, SERVICE_PLAY_MEDIA, data)
 
 
-async def test_setup(
-    hass: HomeAssistantType, aioclient_mock: AiohttpClientMocker
-) -> None:
+async def test_setup(hass: HomeAssistant, aioclient_mock: AiohttpClientMocker) -> None:
     """Test setup with basic config."""
     await setup_integration(hass, aioclient_mock)
     assert hass.states.get(MAIN_ENTITY_ID)
@@ -161,25 +144,28 @@ async def test_setup(
 
 
 async def test_unique_id(
-    hass: HomeAssistantType, aioclient_mock: AiohttpClientMocker
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    aioclient_mock: AiohttpClientMocker,
 ) -> None:
     """Test unique id."""
     await setup_integration(hass, aioclient_mock)
 
-    entity_registry = await hass.helpers.entity_registry.async_get_registry()
-
     main = entity_registry.async_get(MAIN_ENTITY_ID)
+    assert main.original_device_class == MediaPlayerDeviceClass.RECEIVER
     assert main.unique_id == "028877455858"
 
     client = entity_registry.async_get(CLIENT_ENTITY_ID)
+    assert client.original_device_class == MediaPlayerDeviceClass.RECEIVER
     assert client.unique_id == "2CA17D1CD30X"
 
     unavailable_client = entity_registry.async_get(UNAVAILABLE_ENTITY_ID)
+    assert unavailable_client.original_device_class == MediaPlayerDeviceClass.RECEIVER
     assert unavailable_client.unique_id == "9XXXXXXXXXX9"
 
 
 async def test_supported_features(
-    hass: HomeAssistantType, aioclient_mock: AiohttpClientMocker
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
 ) -> None:
     """Test supported features."""
     await setup_integration(hass, aioclient_mock)
@@ -187,32 +173,32 @@ async def test_supported_features(
     # Features supported for main DVR
     state = hass.states.get(MAIN_ENTITY_ID)
     assert (
-        SUPPORT_PAUSE
-        | SUPPORT_TURN_ON
-        | SUPPORT_TURN_OFF
-        | SUPPORT_PLAY_MEDIA
-        | SUPPORT_STOP
-        | SUPPORT_NEXT_TRACK
-        | SUPPORT_PREVIOUS_TRACK
-        | SUPPORT_PLAY
-        == state.attributes.get("supported_features")
+        state.attributes.get("supported_features")
+        == MediaPlayerEntityFeature.PAUSE
+        | MediaPlayerEntityFeature.TURN_ON
+        | MediaPlayerEntityFeature.TURN_OFF
+        | MediaPlayerEntityFeature.PLAY_MEDIA
+        | MediaPlayerEntityFeature.STOP
+        | MediaPlayerEntityFeature.NEXT_TRACK
+        | MediaPlayerEntityFeature.PREVIOUS_TRACK
+        | MediaPlayerEntityFeature.PLAY
     )
 
     # Feature supported for clients.
     state = hass.states.get(CLIENT_ENTITY_ID)
     assert (
-        SUPPORT_PAUSE
-        | SUPPORT_PLAY_MEDIA
-        | SUPPORT_STOP
-        | SUPPORT_NEXT_TRACK
-        | SUPPORT_PREVIOUS_TRACK
-        | SUPPORT_PLAY
-        == state.attributes.get("supported_features")
+        state.attributes.get("supported_features")
+        == MediaPlayerEntityFeature.PAUSE
+        | MediaPlayerEntityFeature.PLAY_MEDIA
+        | MediaPlayerEntityFeature.STOP
+        | MediaPlayerEntityFeature.NEXT_TRACK
+        | MediaPlayerEntityFeature.PREVIOUS_TRACK
+        | MediaPlayerEntityFeature.PLAY
     )
 
 
 async def test_check_attributes(
-    hass: HomeAssistantType,
+    hass: HomeAssistant,
     mock_now: dt_util.dt.datetime,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:
@@ -223,13 +209,13 @@ async def test_check_attributes(
     assert state.state == STATE_PLAYING
 
     assert state.attributes.get(ATTR_MEDIA_CONTENT_ID) == "17016356"
-    assert state.attributes.get(ATTR_MEDIA_CONTENT_TYPE) == MEDIA_TYPE_MOVIE
+    assert state.attributes.get(ATTR_MEDIA_CONTENT_TYPE) == MediaType.MOVIE
     assert state.attributes.get(ATTR_MEDIA_DURATION) == 7200
     assert state.attributes.get(ATTR_MEDIA_POSITION) == 4437
     assert state.attributes.get(ATTR_MEDIA_POSITION_UPDATED_AT)
     assert state.attributes.get(ATTR_MEDIA_TITLE) == "Snow Bride"
     assert state.attributes.get(ATTR_MEDIA_SERIES_TITLE) is None
-    assert state.attributes.get(ATTR_MEDIA_CHANNEL) == "{} ({})".format("HALLHD", "312")
+    assert state.attributes.get(ATTR_MEDIA_CHANNEL) == "HALLHD (312)"
     assert state.attributes.get(ATTR_INPUT_SOURCE) == "312"
     assert not state.attributes.get(ATTR_MEDIA_CURRENTLY_RECORDING)
     assert state.attributes.get(ATTR_MEDIA_RATING) == "TV-G"
@@ -242,13 +228,13 @@ async def test_check_attributes(
     assert state.state == STATE_PLAYING
 
     assert state.attributes.get(ATTR_MEDIA_CONTENT_ID) == "4405732"
-    assert state.attributes.get(ATTR_MEDIA_CONTENT_TYPE) == MEDIA_TYPE_TVSHOW
+    assert state.attributes.get(ATTR_MEDIA_CONTENT_TYPE) == MediaType.TVSHOW
     assert state.attributes.get(ATTR_MEDIA_DURATION) == 1791
     assert state.attributes.get(ATTR_MEDIA_POSITION) == 263
     assert state.attributes.get(ATTR_MEDIA_POSITION_UPDATED_AT)
     assert state.attributes.get(ATTR_MEDIA_TITLE) == "Tyler's Ultimate"
     assert state.attributes.get(ATTR_MEDIA_SERIES_TITLE) == "Spaghetti and Clam Sauce"
-    assert state.attributes.get(ATTR_MEDIA_CHANNEL) == "{} ({})".format("FOODHD", "231")
+    assert state.attributes.get(ATTR_MEDIA_CHANNEL) == "FOODHD (231)"
     assert state.attributes.get(ATTR_INPUT_SOURCE) == "231"
     assert not state.attributes.get(ATTR_MEDIA_CURRENTLY_RECORDING)
     assert state.attributes.get(ATTR_MEDIA_RATING) == "No Rating"
@@ -261,7 +247,7 @@ async def test_check_attributes(
     assert state.state == STATE_PLAYING
 
     assert state.attributes.get(ATTR_MEDIA_CONTENT_ID) == "76917562"
-    assert state.attributes.get(ATTR_MEDIA_CONTENT_TYPE) == MEDIA_TYPE_MUSIC
+    assert state.attributes.get(ATTR_MEDIA_CONTENT_TYPE) == MediaType.MUSIC
     assert state.attributes.get(ATTR_MEDIA_DURATION) == 86400
     assert state.attributes.get(ATTR_MEDIA_POSITION) == 15050
     assert state.attributes.get(ATTR_MEDIA_POSITION_UPDATED_AT)
@@ -269,7 +255,7 @@ async def test_check_attributes(
     assert state.attributes.get(ATTR_MEDIA_ARTIST) == "Gerald Albright"
     assert state.attributes.get(ATTR_MEDIA_ALBUM_NAME) == "Slam Dunk (2014)"
     assert state.attributes.get(ATTR_MEDIA_SERIES_TITLE) is None
-    assert state.attributes.get(ATTR_MEDIA_CHANNEL) == "{} ({})".format("MCSJ", "851")
+    assert state.attributes.get(ATTR_MEDIA_CHANNEL) == "MCSJ (851)"
     assert state.attributes.get(ATTR_INPUT_SOURCE) == "851"
     assert not state.attributes.get(ATTR_MEDIA_CURRENTLY_RECORDING)
     assert state.attributes.get(ATTR_MEDIA_RATING) == "TV-PG"
@@ -319,10 +305,11 @@ async def test_check_attributes(
 
 
 async def test_attributes_paused(
-    hass: HomeAssistantType,
+    hass: HomeAssistant,
     mock_now: dt_util.dt.datetime,
+    freezer: FrozenDateTimeFactory,
     aioclient_mock: AiohttpClientMocker,
-):
+) -> None:
     """Test attributes while paused."""
     await setup_integration(hass, aioclient_mock)
 
@@ -331,11 +318,9 @@ async def test_attributes_paused(
 
     # Test to make sure that ATTR_MEDIA_POSITION_UPDATED_AT is not
     # updated if TV is paused.
-    with patch(
-        "homeassistant.util.dt.utcnow", return_value=mock_now + timedelta(minutes=5)
-    ):
-        await async_media_pause(hass, CLIENT_ENTITY_ID)
-        await hass.async_block_till_done()
+    freezer.move_to(mock_now + timedelta(minutes=5))
+    await async_media_pause(hass, CLIENT_ENTITY_ID)
+    await hass.async_block_till_done()
 
     state = hass.states.get(CLIENT_ENTITY_ID)
     assert state.state == STATE_PAUSED
@@ -343,7 +328,7 @@ async def test_attributes_paused(
 
 
 async def test_main_services(
-    hass: HomeAssistantType,
+    hass: HomeAssistant,
     mock_now: dt_util.dt.datetime,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:

@@ -1,133 +1,178 @@
 """Axis switch platform tests."""
 
-from copy import deepcopy
+from unittest.mock import patch
 
-from homeassistant.components.axis.const import DOMAIN as AXIS_DOMAIN
+from axis.models.api import CONTEXT
+import pytest
+from syrupy import SnapshotAssertion
+
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
-from homeassistant.setup import async_setup_component
-
-from .test_device import (
-    API_DISCOVERY_PORT_MANAGEMENT,
-    API_DISCOVERY_RESPONSE,
-    NAME,
-    setup_axis_integration,
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    STATE_ON,
+    Platform,
 )
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-from tests.async_mock import Mock, patch
+from .conftest import ConfigEntryFactoryType, RtspEventMock
+from .const import API_DISCOVERY_PORT_MANAGEMENT, NAME
 
-EVENTS = [
-    {
-        "operation": "Initialized",
-        "topic": "tns1:Device/Trigger/Relay",
-        "source": "RelayToken",
-        "source_idx": "0",
-        "type": "LogicalState",
-        "value": "inactive",
+from tests.common import snapshot_platform
+
+PORT_DATA = """root.IOPort.I0.Configurable=yes
+root.IOPort.I0.Direction=output
+root.IOPort.I0.Output.Name=Doorbell
+root.IOPort.I0.Output.Active=closed
+root.IOPort.I1.Configurable=yes
+root.IOPort.I1.Direction=output
+root.IOPort.I1.Output.Name=
+root.IOPort.I1.Output.Active=open
+"""
+
+PORT_MANAGEMENT_RESPONSE = {
+    "apiVersion": "1.0",
+    "method": "getPorts",
+    "context": CONTEXT,
+    "data": {
+        "numberOfPorts": 2,
+        "items": [
+            {
+                "port": "0",
+                "configurable": True,
+                "usage": "",
+                "name": "Doorbell",
+                "direction": "output",
+                "state": "open",
+                "normalState": "open",
+            },
+            {
+                "port": "1",
+                "configurable": True,
+                "usage": "",
+                "name": "",
+                "direction": "output",
+                "state": "open",
+                "normalState": "open",
+            },
+        ],
     },
-    {
-        "operation": "Initialized",
-        "topic": "tns1:Device/Trigger/Relay",
-        "source": "RelayToken",
-        "source_idx": "1",
-        "type": "LogicalState",
-        "value": "active",
-    },
-]
+}
 
 
-async def test_platform_manually_configured(hass):
-    """Test that nothing happens when platform is manually configured."""
-    assert await async_setup_component(
-        hass, SWITCH_DOMAIN, {SWITCH_DOMAIN: {"platform": AXIS_DOMAIN}}
-    )
-
-    assert AXIS_DOMAIN not in hass.data
-
-
-async def test_no_switches(hass):
-    """Test that no output events in Axis results in no switch entities."""
-    await setup_axis_integration(hass)
-
-    assert not hass.states.async_entity_ids(SWITCH_DOMAIN)
-
-
-async def test_switches_with_port_cgi(hass):
+@pytest.mark.parametrize("param_ports_payload", [PORT_DATA])
+async def test_switches_with_port_cgi(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    config_entry_factory: ConfigEntryFactoryType,
+    mock_rtsp_event: RtspEventMock,
+    snapshot: SnapshotAssertion,
+) -> None:
     """Test that switches are loaded properly using port.cgi."""
-    device = await setup_axis_integration(hass)
+    with patch("homeassistant.components.axis.PLATFORMS", [Platform.SWITCH]):
+        config_entry = await config_entry_factory()
 
-    device.api.vapix.ports = {"0": Mock(), "1": Mock()}
-    device.api.vapix.ports["0"].name = "Doorbell"
-    device.api.vapix.ports["1"].name = ""
-
-    for event in EVENTS:
-        device.api.event.process_event(event)
+    mock_rtsp_event(
+        topic="tns1:Device/Trigger/Relay",
+        data_type="LogicalState",
+        data_value="inactive",
+        source_name="RelayToken",
+        source_idx="0",
+    )
+    mock_rtsp_event(
+        topic="tns1:Device/Trigger/Relay",
+        data_type="LogicalState",
+        data_value="active",
+        source_name="RelayToken",
+        source_idx="1",
+    )
     await hass.async_block_till_done()
 
-    assert len(hass.states.async_entity_ids(SWITCH_DOMAIN)) == 2
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
 
-    relay_0 = hass.states.get(f"switch.{NAME}_doorbell")
-    assert relay_0.state == "off"
-    assert relay_0.name == f"{NAME} Doorbell"
+    entity_id = f"{SWITCH_DOMAIN}.{NAME}_doorbell"
 
-    relay_1 = hass.states.get(f"switch.{NAME}_relay_1")
-    assert relay_1.state == "on"
-    assert relay_1.name == f"{NAME} Relay 1"
+    with patch("axis.interfaces.vapix.Ports.close") as mock_turn_on:
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_ON,
+            {ATTR_ENTITY_ID: entity_id},
+            blocking=True,
+        )
+        mock_turn_on.assert_called_once_with("0")
 
-    await hass.services.async_call(
-        SWITCH_DOMAIN,
-        "turn_on",
-        {"entity_id": f"switch.{NAME}_doorbell"},
-        blocking=True,
-    )
-    device.api.vapix.ports["0"].close.assert_called_once()
-
-    await hass.services.async_call(
-        SWITCH_DOMAIN,
-        "turn_off",
-        {"entity_id": f"switch.{NAME}_doorbell"},
-        blocking=True,
-    )
-    device.api.vapix.ports["0"].open.assert_called_once()
+    with patch("axis.interfaces.vapix.Ports.open") as mock_turn_off:
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: entity_id},
+            blocking=True,
+        )
+        mock_turn_off.assert_called_once_with("0")
 
 
-async def test_switches_with_port_management(hass):
+@pytest.mark.parametrize("api_discovery_items", [API_DISCOVERY_PORT_MANAGEMENT])
+@pytest.mark.parametrize("port_management_payload", [PORT_MANAGEMENT_RESPONSE])
+async def test_switches_with_port_management(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    config_entry_factory: ConfigEntryFactoryType,
+    mock_rtsp_event: RtspEventMock,
+    snapshot: SnapshotAssertion,
+) -> None:
     """Test that switches are loaded properly using port management."""
-    api_discovery = deepcopy(API_DISCOVERY_RESPONSE)
-    api_discovery["data"]["apiList"].append(API_DISCOVERY_PORT_MANAGEMENT)
+    with patch("homeassistant.components.axis.PLATFORMS", [Platform.SWITCH]):
+        config_entry = await config_entry_factory()
 
-    with patch.dict(API_DISCOVERY_RESPONSE, api_discovery):
-        device = await setup_axis_integration(hass)
-
-    device.api.vapix.ports = {"0": Mock(), "1": Mock()}
-    device.api.vapix.ports["0"].name = "Doorbell"
-    device.api.vapix.ports["1"].name = ""
-
-    for event in EVENTS:
-        device.api.event.process_event(event)
+    mock_rtsp_event(
+        topic="tns1:Device/Trigger/Relay",
+        data_type="LogicalState",
+        data_value="inactive",
+        source_name="RelayToken",
+        source_idx="0",
+    )
+    mock_rtsp_event(
+        topic="tns1:Device/Trigger/Relay",
+        data_type="LogicalState",
+        data_value="active",
+        source_name="RelayToken",
+        source_idx="1",
+    )
     await hass.async_block_till_done()
 
-    assert len(hass.states.async_entity_ids(SWITCH_DOMAIN)) == 2
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
 
-    relay_0 = hass.states.get(f"switch.{NAME}_doorbell")
-    assert relay_0.state == "off"
-    assert relay_0.name == f"{NAME} Doorbell"
+    entity_id = f"{SWITCH_DOMAIN}.{NAME}_doorbell"
 
-    relay_1 = hass.states.get(f"switch.{NAME}_relay_1")
-    assert relay_1.state == "on"
-    assert relay_1.name == f"{NAME} Relay 1"
+    with patch("axis.interfaces.vapix.IoPortManagement.close") as mock_turn_on:
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_ON,
+            {ATTR_ENTITY_ID: entity_id},
+            blocking=True,
+        )
+        mock_turn_on.assert_called_once_with("0")
 
-    await hass.services.async_call(
-        SWITCH_DOMAIN,
-        "turn_on",
-        {"entity_id": f"switch.{NAME}_doorbell"},
-        blocking=True,
+    with patch("axis.interfaces.vapix.IoPortManagement.open") as mock_turn_off:
+        await hass.services.async_call(
+            SWITCH_DOMAIN,
+            SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: entity_id},
+            blocking=True,
+        )
+        mock_turn_off.assert_called_once_with("0")
+
+    # State update
+
+    mock_rtsp_event(
+        topic="tns1:Device/Trigger/Relay",
+        data_type="LogicalState",
+        data_value="active",
+        source_name="RelayToken",
+        source_idx="0",
     )
-    device.api.vapix.ports["0"].close.assert_called_once()
+    await hass.async_block_till_done()
 
-    await hass.services.async_call(
-        SWITCH_DOMAIN,
-        "turn_off",
-        {"entity_id": f"switch.{NAME}_doorbell"},
-        blocking=True,
-    )
-    device.api.vapix.ports["0"].open.assert_called_once()
+    assert hass.states.get(f"{SWITCH_DOMAIN}.{NAME}_relay_1").state == STATE_ON

@@ -1,96 +1,64 @@
 """Test Axis component setup process."""
+
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
 from homeassistant.components import axis
-from homeassistant.components.axis.const import CONF_MODEL, DOMAIN as AXIS_DOMAIN
-from homeassistant.const import (
-    CONF_DEVICE,
-    CONF_HOST,
-    CONF_MAC,
-    CONF_NAME,
-    CONF_PASSWORD,
-    CONF_PORT,
-    CONF_USERNAME,
-)
-from homeassistant.setup import async_setup_component
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
 
-from .test_device import MAC, setup_axis_integration
-
-from tests.async_mock import AsyncMock, Mock, patch
 from tests.common import MockConfigEntry
 
 
-async def test_setup_no_config(hass):
-    """Test setup without configuration."""
-    assert await async_setup_component(hass, AXIS_DOMAIN, {})
-    assert AXIS_DOMAIN not in hass.data
-
-
-async def test_setup_entry(hass):
+async def test_setup_entry(config_entry_setup: MockConfigEntry) -> None:
     """Test successful setup of entry."""
-    await setup_axis_integration(hass)
-    assert len(hass.data[AXIS_DOMAIN]) == 1
-    assert MAC in hass.data[AXIS_DOMAIN]
+    assert config_entry_setup.state is ConfigEntryState.LOADED
 
 
-async def test_setup_entry_fails(hass):
+async def test_setup_entry_fails(
+    hass: HomeAssistant, config_entry: MockConfigEntry
+) -> None:
     """Test successful setup of entry."""
-    config_entry = MockConfigEntry(
-        domain=AXIS_DOMAIN, data={CONF_MAC: "0123"}, version=2
-    )
     config_entry.add_to_hass(hass)
 
     mock_device = Mock()
     mock_device.async_setup = AsyncMock(return_value=False)
 
-    with patch.object(axis, "AxisNetworkDevice") as mock_device_class:
+    with patch.object(axis, "AxisHub") as mock_device_class:
         mock_device_class.return_value = mock_device
 
         assert not await hass.config_entries.async_setup(config_entry.entry_id)
 
-    assert not hass.data[AXIS_DOMAIN]
+    assert config_entry.state is ConfigEntryState.SETUP_ERROR
 
 
-async def test_unload_entry(hass):
+async def test_unload_entry(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
     """Test successful unload of entry."""
-    device = await setup_axis_integration(hass)
-    assert hass.data[AXIS_DOMAIN]
+    assert config_entry_setup.state is ConfigEntryState.LOADED
 
-    assert await hass.config_entries.async_unload(device.config_entry.entry_id)
-    assert not hass.data[AXIS_DOMAIN]
+    assert await hass.config_entries.async_unload(config_entry_setup.entry_id)
+    assert config_entry_setup.state is ConfigEntryState.NOT_LOADED
 
 
-async def test_migrate_entry(hass):
+@pytest.mark.parametrize("config_entry_version", [1])
+async def test_migrate_entry(
+    hass: HomeAssistant, config_entry: MockConfigEntry
+) -> None:
     """Test successful migration of entry data."""
-    legacy_config = {
-        CONF_DEVICE: {
-            CONF_HOST: "1.2.3.4",
-            CONF_USERNAME: "username",
-            CONF_PASSWORD: "password",
-            CONF_PORT: 80,
-        },
-        CONF_MAC: "mac",
-        CONF_MODEL: "model",
-        CONF_NAME: "name",
-    }
-    entry = MockConfigEntry(domain=AXIS_DOMAIN, data=legacy_config)
+    config_entry.add_to_hass(hass)
+    assert config_entry.version == 1
 
-    assert entry.data == legacy_config
-    assert entry.version == 1
+    mock_device = Mock()
+    mock_device.async_setup = AsyncMock()
+    mock_device.async_update_device_registry = AsyncMock()
+    mock_device.api.vapix.light_control = None
+    mock_device.api.vapix.params.image_format = None
 
-    await entry.async_migrate(hass)
+    with patch("homeassistant.components.axis.async_setup_entry", return_value=True):
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
 
-    assert entry.data == {
-        CONF_DEVICE: {
-            CONF_HOST: "1.2.3.4",
-            CONF_USERNAME: "username",
-            CONF_PASSWORD: "password",
-            CONF_PORT: 80,
-        },
-        CONF_HOST: "1.2.3.4",
-        CONF_USERNAME: "username",
-        CONF_PASSWORD: "password",
-        CONF_PORT: 80,
-        CONF_MAC: "mac",
-        CONF_MODEL: "model",
-        CONF_NAME: "name",
-    }
-    assert entry.version == 2
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert config_entry.version == 3

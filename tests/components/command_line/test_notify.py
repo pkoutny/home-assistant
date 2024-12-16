@@ -1,95 +1,196 @@
 """The tests for the command line notification platform."""
+
+from __future__ import annotations
+
 import os
+from pathlib import Path
+import subprocess
 import tempfile
-import unittest
+from unittest.mock import patch
 
-import homeassistant.components.notify as notify
-from homeassistant.setup import setup_component
+import pytest
 
-from tests.async_mock import patch
-from tests.common import assert_setup_component, get_test_home_assistant
+from homeassistant import setup
+from homeassistant.components.command_line import DOMAIN
+from homeassistant.components.notify import DOMAIN as NOTIFY_DOMAIN
+from homeassistant.core import HomeAssistant
 
 
-class TestCommandLine(unittest.TestCase):
-    """Test the command line notifications."""
+async def test_setup_platform_yaml(hass: HomeAssistant) -> None:
+    """Test setting up the platform with platform yaml."""
+    await setup.async_setup_component(
+        hass,
+        "notify",
+        {
+            "notify": {
+                "platform": "command_line",
+                "command": "echo 1",
+                "payload_on": "1",
+                "payload_off": "0",
+            }
+        },
+    )
+    await hass.async_block_till_done()
+    assert len(hass.states.async_all()) == 0
 
-    def setUp(self):  # pylint: disable=invalid-name
-        """Set up things to be run when tests are started."""
-        self.hass = get_test_home_assistant()
-        self.addCleanup(self.tear_down_cleanup)
 
-    def tear_down_cleanup(self):
-        """Stop down everything that was started."""
-        self.hass.stop()
-
-    def test_setup(self):
-        """Test setup."""
-        with assert_setup_component(1) as handle_config:
-            assert setup_component(
-                self.hass,
-                "notify",
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
                 {
                     "notify": {
-                        "name": "test",
-                        "platform": "command_line",
-                        "command": "echo $(cat); exit 1",
+                        "command": "exit 0",
+                        "name": "Test2",
                     }
-                },
-            )
-        assert handle_config[notify.DOMAIN]
+                }
+            ]
+        }
+    ],
+)
+async def test_setup_integration_yaml(
+    hass: HomeAssistant, load_yaml_integration: None
+) -> None:
+    """Test sensor setup."""
+    assert hass.services.has_service(NOTIFY_DOMAIN, "test2")
 
-    def test_bad_config(self):
-        """Test set up the platform with bad/missing configuration."""
-        config = {notify.DOMAIN: {"name": "test", "platform": "command_line"}}
-        with assert_setup_component(0) as handle_config:
-            assert setup_component(self.hass, notify.DOMAIN, config)
-        assert not handle_config[notify.DOMAIN]
 
-    def test_command_line_output(self):
-        """Test the command line output."""
-        with tempfile.TemporaryDirectory() as tempdirname:
-            filename = os.path.join(tempdirname, "message.txt")
-            message = "one, two, testing, testing"
-            with assert_setup_component(1) as handle_config:
-                assert setup_component(
-                    self.hass,
-                    notify.DOMAIN,
+async def test_bad_config(hass: HomeAssistant) -> None:
+    """Test set up the platform with bad/missing configuration."""
+    assert await setup.async_setup_component(
+        hass,
+        NOTIFY_DOMAIN,
+        {
+            NOTIFY_DOMAIN: [
+                {"platform": "command_line"},
+            ]
+        },
+    )
+    await hass.async_block_till_done()
+    assert not hass.services.has_service(NOTIFY_DOMAIN, "test")
+
+
+async def test_command_line_output(hass: HomeAssistant) -> None:
+    """Test the command line output."""
+    with tempfile.TemporaryDirectory() as tempdirname:
+        filename = os.path.join(tempdirname, "message.txt")
+        message = "one, two, testing, testing"
+        await setup.async_setup_component(
+            hass,
+            DOMAIN,
+            {
+                "command_line": [
                     {
                         "notify": {
-                            "name": "test",
-                            "platform": "command_line",
-                            "command": f"echo $(cat) > {filename}",
+                            "command": f"cat > {filename}",
+                            "name": "Test3",
                         }
-                    },
-                )
-            assert handle_config[notify.DOMAIN]
+                    }
+                ]
+            },
+        )
+        await hass.async_block_till_done()
 
-            assert self.hass.services.call(
-                "notify", "test", {"message": message}, blocking=True
-            )
+        assert hass.services.has_service(NOTIFY_DOMAIN, "test3")
 
-            with open(filename) as fil:
-                # the echo command adds a line break
-                assert fil.read() == f"{message}\n"
+        await hass.services.async_call(
+            NOTIFY_DOMAIN, "test3", {"message": message}, blocking=True
+        )
+        assert message == await hass.async_add_executor_job(Path(filename).read_text)
 
-    @patch("homeassistant.components.command_line.notify._LOGGER.error")
-    def test_error_for_none_zero_exit_code(self, mock_error):
-        """Test if an error is logged for non zero exit codes."""
-        with assert_setup_component(1) as handle_config:
-            assert setup_component(
-                self.hass,
-                notify.DOMAIN,
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
                 {
                     "notify": {
-                        "name": "test",
-                        "platform": "command_line",
-                        "command": "echo $(cat); exit 1",
+                        "command": "exit 1",
+                        "name": "Test4",
                     }
-                },
-            )
-        assert handle_config[notify.DOMAIN]
+                }
+            ]
+        }
+    ],
+)
+async def test_error_for_none_zero_exit_code(
+    caplog: pytest.LogCaptureFixture, hass: HomeAssistant, load_yaml_integration: None
+) -> None:
+    """Test if an error is logged for non zero exit codes."""
 
-        assert self.hass.services.call(
-            "notify", "test", {"message": "error"}, blocking=True
+    await hass.services.async_call(
+        NOTIFY_DOMAIN, "test4", {"message": "error"}, blocking=True
+    )
+    assert "Command failed" in caplog.text
+    assert "return code 1" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "notify": {
+                        "command": "sleep 10000",
+                        "command_timeout": 0.0000001,
+                        "name": "Test5",
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_timeout(
+    caplog: pytest.LogCaptureFixture, hass: HomeAssistant, load_yaml_integration: None
+) -> None:
+    """Test blocking is not forever."""
+    await hass.services.async_call(
+        NOTIFY_DOMAIN, "test5", {"message": "error"}, blocking=True
+    )
+    assert "Timeout" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "get_config",
+    [
+        {
+            "command_line": [
+                {
+                    "notify": {
+                        "command": "exit 0",
+                        "name": "Test6",
+                    }
+                }
+            ]
+        }
+    ],
+)
+async def test_subprocess_exceptions(
+    caplog: pytest.LogCaptureFixture, hass: HomeAssistant, load_yaml_integration: None
+) -> None:
+    """Test that notify subprocess exceptions are handled correctly."""
+
+    with patch(
+        "homeassistant.components.command_line.notify.subprocess.Popen"
+    ) as check_output:
+        check_output.return_value.__enter__ = check_output
+        check_output.return_value.communicate.side_effect = [
+            subprocess.TimeoutExpired("cmd", 10),
+            None,
+            subprocess.SubprocessError(),
+        ]
+
+        await hass.services.async_call(
+            NOTIFY_DOMAIN, "test6", {"message": "error"}, blocking=True
         )
-        assert mock_error.call_count == 1
+        assert check_output.call_count == 2
+        assert "Timeout for command" in caplog.text
+
+        await hass.services.async_call(
+            NOTIFY_DOMAIN, "test6", {"message": "error"}, blocking=True
+        )
+        assert check_output.call_count == 4
+        assert "Error trying to exec command" in caplog.text

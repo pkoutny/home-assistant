@@ -1,147 +1,244 @@
 """Tests for the Tuya config flow."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
 import pytest
-from tuyaha.tuyaapi import TuyaAPIException, TuyaNetException
+from syrupy.assertion import SnapshotAssertion
 
-from homeassistant import config_entries, data_entry_flow, setup
-from homeassistant.components.tuya.const import CONF_COUNTRYCODE, DOMAIN
-from homeassistant.const import CONF_PASSWORD, CONF_PLATFORM, CONF_USERNAME
+from homeassistant.components.tuya.const import CONF_APP_TYPE, CONF_USER_CODE, DOMAIN
+from homeassistant.config_entries import SOURCE_USER
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 
-from tests.async_mock import Mock, patch
 from tests.common import MockConfigEntry
 
-USERNAME = "myUsername"
-PASSWORD = "myPassword"
-COUNTRY_CODE = "1"
-TUYA_PLATFORM = "tuya"
-
-TUYA_USER_DATA = {
-    CONF_USERNAME: USERNAME,
-    CONF_PASSWORD: PASSWORD,
-    CONF_COUNTRYCODE: COUNTRY_CODE,
-    CONF_PLATFORM: TUYA_PLATFORM,
-}
+pytestmark = pytest.mark.usefixtures("mock_setup_entry")
 
 
-@pytest.fixture(name="tuya")
-def tuya_fixture() -> Mock:
-    """Patch libraries."""
-    with patch("homeassistant.components.tuya.config_flow.TuyaApi") as tuya:
-        yield tuya
-
-
-async def test_user(hass, tuya):
-    """Test user config."""
-    await setup.async_setup_component(hass, "persistent_notification", {})
+@pytest.mark.usefixtures("mock_tuya_login_control")
+async def test_user_flow(
+    hass: HomeAssistant,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test the full happy path user flow from start to finish."""
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
+        DOMAIN,
+        context={"source": SOURCE_USER},
     )
 
-    assert result["type"] == data_entry_flow.RESULT_TYPE_FORM
-    assert result["step_id"] == "user"
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
 
-    with patch(
-        "homeassistant.components.tuya.async_setup", return_value=True
-    ) as mock_setup, patch(
-        "homeassistant.components.tuya.async_setup_entry", return_value=True
-    ) as mock_setup_entry:
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], user_input=TUYA_USER_DATA
-        )
-
-    assert result["type"] == data_entry_flow.RESULT_TYPE_CREATE_ENTRY
-    assert result["title"] == USERNAME
-    assert result["data"][CONF_USERNAME] == USERNAME
-    assert result["data"][CONF_PASSWORD] == PASSWORD
-    assert result["data"][CONF_COUNTRYCODE] == COUNTRY_CODE
-    assert result["data"][CONF_PLATFORM] == TUYA_PLATFORM
-    assert not result["result"].unique_id
-
-    await hass.async_block_till_done()
-    assert len(mock_setup.mock_calls) == 1
-    assert len(mock_setup_entry.mock_calls) == 1
-
-
-async def test_import(hass, tuya):
-    """Test import step."""
-    await setup.async_setup_component(hass, "persistent_notification", {})
-    with patch(
-        "homeassistant.components.tuya.async_setup", return_value=True,
-    ) as mock_setup, patch(
-        "homeassistant.components.tuya.async_setup_entry", return_value=True,
-    ) as mock_setup_entry:
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_IMPORT},
-            data=TUYA_USER_DATA,
-        )
-
-    assert result["type"] == data_entry_flow.RESULT_TYPE_CREATE_ENTRY
-    assert result["title"] == USERNAME
-    assert result["data"][CONF_USERNAME] == USERNAME
-    assert result["data"][CONF_PASSWORD] == PASSWORD
-    assert result["data"][CONF_COUNTRYCODE] == COUNTRY_CODE
-    assert result["data"][CONF_PLATFORM] == TUYA_PLATFORM
-    assert not result["result"].unique_id
-
-    await hass.async_block_till_done()
-    assert len(mock_setup.mock_calls) == 1
-    assert len(mock_setup_entry.mock_calls) == 1
-
-
-async def test_abort_if_already_setup(hass, tuya):
-    """Test we abort if Tuya is already setup."""
-    MockConfigEntry(domain=DOMAIN, data=TUYA_USER_DATA).add_to_hass(hass)
-
-    # Should fail, config exist (import)
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}, data=TUYA_USER_DATA
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_USER_CODE: "12345"},
     )
 
-    assert result["type"] == data_entry_flow.RESULT_TYPE_ABORT
-    assert result["reason"] == "single_instance_allowed"
+    assert result2.get("type") is FlowResultType.FORM
+    assert result2.get("step_id") == "scan"
 
-    # Should fail, config exist (flow)
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_IMPORT}, data=TUYA_USER_DATA
+    result3 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={},
     )
 
-    assert result["type"] == data_entry_flow.RESULT_TYPE_ABORT
-    assert result["reason"] == "single_instance_allowed"
+    assert result3.get("type") is FlowResultType.CREATE_ENTRY
+    assert result3 == snapshot
 
 
-async def test_abort_on_invalid_credentials(hass, tuya):
-    """Test when we have invalid credentials."""
-    tuya().init.side_effect = TuyaAPIException("Boom")
-
+async def test_user_flow_failed_qr_code(
+    hass: HomeAssistant,
+    mock_tuya_login_control: MagicMock,
+) -> None:
+    """Test an error occurring while retrieving the QR code."""
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}, data=TUYA_USER_DATA
+        DOMAIN,
+        context={"source": SOURCE_USER},
     )
 
-    assert result["type"] == data_entry_flow.RESULT_TYPE_FORM
-    assert result["errors"] == {"base": "auth_failed"}
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_IMPORT}, data=TUYA_USER_DATA
+    # Something went wrong getting the QR code (like an invalid user code)
+    mock_tuya_login_control.qr_code.return_value["success"] = False
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_USER_CODE: "12345"},
     )
 
-    assert result["type"] == data_entry_flow.RESULT_TYPE_ABORT
-    assert result["reason"] == "auth_failed"
+    assert result2.get("type") is FlowResultType.FORM
+    assert result2.get("errors") == {"base": "login_error"}
 
+    # This time it worked out
+    mock_tuya_login_control.qr_code.return_value["success"] = True
 
-async def test_abort_on_connection_error(hass, tuya):
-    """Test when we have a network error."""
-    tuya().init.side_effect = TuyaNetException("Boom")
+    result3 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_USER_CODE: "12345"},
+    )
+    assert result3.get("step_id") == "scan"
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}, data=TUYA_USER_DATA
+    result3 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={},
     )
 
-    assert result["type"] == data_entry_flow.RESULT_TYPE_ABORT
-    assert result["reason"] == "conn_error"
+    assert result3.get("type") is FlowResultType.CREATE_ENTRY
 
+
+async def test_user_flow_failed_scan(
+    hass: HomeAssistant,
+    mock_tuya_login_control: MagicMock,
+) -> None:
+    """Test an error occurring while verifying login."""
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_IMPORT}, data=TUYA_USER_DATA
+        DOMAIN,
+        context={"source": SOURCE_USER},
     )
 
-    assert result["type"] == data_entry_flow.RESULT_TYPE_ABORT
-    assert result["reason"] == "conn_error"
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_USER_CODE: "12345"},
+    )
+
+    assert result2.get("type") is FlowResultType.FORM
+    assert result2.get("step_id") == "scan"
+
+    # Access has been denied, or the code hasn't been scanned yet
+    good_values = mock_tuya_login_control.login_result.return_value
+    mock_tuya_login_control.login_result.return_value = (
+        False,
+        {"msg": "oops", "code": 42},
+    )
+
+    result3 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={},
+    )
+
+    assert result3.get("type") is FlowResultType.FORM
+    assert result3.get("errors") == {"base": "login_error"}
+
+    # This time it worked out
+    mock_tuya_login_control.login_result.return_value = good_values
+
+    result4 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={},
+    )
+
+    assert result4.get("type") is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.usefixtures("mock_tuya_login_control")
+async def test_reauth_flow(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test the reauthentication configuration flow."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "scan"
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={},
+    )
+
+    assert result2.get("type") is FlowResultType.ABORT
+    assert result2.get("reason") == "reauth_successful"
+
+    assert mock_config_entry == snapshot
+
+
+@pytest.mark.usefixtures("mock_tuya_login_control")
+async def test_reauth_flow_migration(
+    hass: HomeAssistant,
+    mock_old_config_entry: MockConfigEntry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test the reauthentication configuration flow.
+
+    This flow tests the migration from an old config entry.
+    """
+    mock_old_config_entry.add_to_hass(hass)
+
+    # Ensure old data is there, new data is missing
+    assert CONF_APP_TYPE in mock_old_config_entry.data
+    assert CONF_USER_CODE not in mock_old_config_entry.data
+
+    result = await mock_old_config_entry.start_reauth_flow(hass)
+
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "reauth_user_code"
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_USER_CODE: "12345"},
+    )
+
+    assert result2.get("type") is FlowResultType.FORM
+    assert result2.get("step_id") == "scan"
+
+    result3 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={},
+    )
+
+    assert result3.get("type") is FlowResultType.ABORT
+    assert result3.get("reason") == "reauth_successful"
+
+    # Ensure the old data is gone, new data is present
+    assert CONF_APP_TYPE not in mock_old_config_entry.data
+    assert CONF_USER_CODE in mock_old_config_entry.data
+
+    assert mock_old_config_entry == snapshot
+
+
+async def test_reauth_flow_failed_qr_code(
+    hass: HomeAssistant,
+    mock_tuya_login_control: MagicMock,
+    mock_old_config_entry: MockConfigEntry,
+) -> None:
+    """Test an error occurring while retrieving the QR code."""
+    mock_old_config_entry.add_to_hass(hass)
+
+    result = await mock_old_config_entry.start_reauth_flow(hass)
+
+    # Something went wrong getting the QR code (like an invalid user code)
+    mock_tuya_login_control.qr_code.return_value["success"] = False
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_USER_CODE: "12345"},
+    )
+
+    assert result2.get("type") is FlowResultType.FORM
+    assert result2.get("errors") == {"base": "login_error"}
+
+    # This time it worked out
+    mock_tuya_login_control.qr_code.return_value["success"] = True
+
+    result3 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_USER_CODE: "12345"},
+    )
+    assert result3.get("step_id") == "scan"
+
+    result3 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={},
+    )
+
+    assert result3.get("type") is FlowResultType.ABORT
+    assert result3.get("reason") == "reauth_successful"

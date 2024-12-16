@@ -1,46 +1,88 @@
 """Validate manifests."""
+
+from __future__ import annotations
+
 import argparse
-import pathlib
+from operator import attrgetter
+from pathlib import Path
 import sys
 from time import monotonic
 
 from . import (
+    application_credentials,
+    bluetooth,
     codeowners,
     config_flow,
-    coverage,
+    config_schema,
     dependencies,
+    dhcp,
+    docker,
+    icons,
     json,
     manifest,
+    metadata,
+    mqtt,
+    mypy_config,
+    quality_scale,
+    requirements,
     services,
     ssdp,
     translations,
+    usb,
     zeroconf,
 )
 from .model import Config, Integration
 
 INTEGRATION_PLUGINS = [
-    json,
+    application_credentials,
+    bluetooth,
     codeowners,
-    config_flow,
+    config_schema,
     dependencies,
+    dhcp,
+    icons,
+    json,
     manifest,
+    mqtt,
+    quality_scale,
+    requirements,
     services,
     ssdp,
     translations,
+    usb,
     zeroconf,
+    config_flow,  # This needs to run last, after translations are processed
 ]
 HASS_PLUGINS = [
-    coverage,
+    docker,
+    mypy_config,
+    metadata,
+]
+
+ALL_PLUGIN_NAMES = [
+    plugin.__name__.rsplit(".", maxsplit=1)[-1]
+    for plugin in (*INTEGRATION_PLUGINS, *HASS_PLUGINS)
 ]
 
 
-def valid_integration_path(integration_path):
+def valid_integration_path(integration_path: Path | str) -> Path:
     """Test if it's a valid integration."""
-    path = pathlib.Path(integration_path)
+    path = Path(integration_path)
     if not path.is_dir():
         raise argparse.ArgumentTypeError(f"{integration_path} is not a directory.")
 
     return path
+
+
+def validate_plugins(plugin_names: str) -> list[str]:
+    """Split and validate plugin names."""
+    all_plugin_names = set(ALL_PLUGIN_NAMES)
+    plugins = plugin_names.split(",")
+    for plugin in plugins:
+        if plugin not in all_plugin_names:
+            raise argparse.ArgumentTypeError(f"{plugin} is not a valid plugin name")
+
+    return plugins
 
 
 def get_config() -> Config:
@@ -55,6 +97,24 @@ def get_config() -> Config:
         type=valid_integration_path,
         help="Validate a single integration",
     )
+    parser.add_argument(
+        "--requirements",
+        action="store_true",
+        help="Validate requirements",
+    )
+    parser.add_argument(
+        "-p",
+        "--plugins",
+        type=validate_plugins,
+        default=ALL_PLUGIN_NAMES,
+        help="Comma-separate list of plugins to run. Valid plugin names: %(default)s",
+    )
+    parser.add_argument(
+        "--core-path",
+        type=Path,
+        default=Path(),
+        help="Path to core",
+    )
     parsed = parser.parse_args()
 
     if parsed.action is None:
@@ -67,18 +127,20 @@ def get_config() -> Config:
 
     if (
         not parsed.integration_path
-        and not pathlib.Path("requirements_all.txt").is_file()
+        and not (parsed.core_path / "requirements_all.txt").is_file()
     ):
         raise RuntimeError("Run from Home Assistant root")
 
     return Config(
-        root=pathlib.Path(".").absolute(),
+        root=parsed.core_path.absolute(),
         specific_integrations=parsed.integration_path,
         action=parsed.action,
+        requirements=parsed.requirements,
+        plugins=set(parsed.plugins),
     )
 
 
-def main():
+def main() -> int:
     """Validate manifests."""
     try:
         config = get_config()
@@ -86,26 +148,35 @@ def main():
         print(err)
         return 1
 
-    plugins = INTEGRATION_PLUGINS
+    plugins = [*INTEGRATION_PLUGINS]
 
     if config.specific_integrations:
         integrations = {}
 
         for int_path in config.specific_integrations:
-            integration = Integration(int_path)
+            integration = Integration(int_path, config)
             integration.load_manifest()
             integrations[integration.domain] = integration
 
     else:
-        integrations = Integration.load_dir(pathlib.Path("homeassistant/components"))
+        integrations = Integration.load_dir(config.core_integrations_path, config)
         plugins += HASS_PLUGINS
 
     for plugin in plugins:
+        plugin_name = plugin.__name__.rsplit(".", maxsplit=1)[-1]
+        if plugin_name not in config.plugins:
+            continue
         try:
             start = monotonic()
-            print(f"Validating {plugin.__name__.split('.')[-1]}...", end="", flush=True)
+            print(f"Validating {plugin_name}...", end="", flush=True)
+            if (
+                plugin is requirements
+                and config.requirements
+                and not config.specific_integrations
+            ):
+                print()
             plugin.validate(integrations, config)
-            print(" done in {:.2f}s".format(monotonic() - start))
+            print(f" done in {monotonic() - start:.2f}s")
         except RuntimeError as err:
             print()
             print()
@@ -139,6 +210,9 @@ def main():
 
         if config.action == "generate":
             for plugin in plugins:
+                plugin_name = plugin.__name__.rsplit(".", maxsplit=1)[-1]
+                if plugin_name not in config.plugins:
+                    continue
                 if hasattr(plugin, "generate"):
                     plugin.generate(integrations, config)
         return 0
@@ -160,14 +234,19 @@ def main():
     return 1
 
 
-def print_integrations_status(config, integrations, *, show_fixable_errors=True):
+def print_integrations_status(
+    config: Config,
+    integrations: list[Integration],
+    *,
+    show_fixable_errors: bool = True,
+) -> None:
     """Print integration status."""
-    for integration in sorted(integrations, key=lambda itg: itg.domain):
+    for integration in sorted(integrations, key=attrgetter("domain")):
         extra = f" - {integration.path}" if config.specific_integrations else ""
         print(f"Integration {integration.domain}{extra}:")
         for error in integration.errors:
             if show_fixable_errors or not error.fixable:
-                print("*", error)
+                print("*", "[ERROR]", error)
         for warning in integration.warnings:
             print("*", "[WARNING]", warning)
         print()

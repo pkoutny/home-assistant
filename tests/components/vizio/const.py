@@ -1,10 +1,11 @@
 """Constants for the Vizio integration tests."""
-import logging
 
+from ipaddress import ip_address
+
+from homeassistant.components import zeroconf
 from homeassistant.components.media_player import (
-    DEVICE_CLASS_SPEAKER,
-    DEVICE_CLASS_TV,
     DOMAIN as MP_DOMAIN,
+    MediaPlayerDeviceClass,
 )
 from homeassistant.components.vizio.const import (
     CONF_ADDITIONAL_CONFIGS,
@@ -25,12 +26,8 @@ from homeassistant.const import (
     CONF_INCLUDE,
     CONF_NAME,
     CONF_PIN,
-    CONF_PORT,
-    CONF_TYPE,
 )
 from homeassistant.util import slugify
-
-_LOGGER = logging.getLogger(__name__)
 
 NAME = "Vizio"
 NAME2 = "Vizio2"
@@ -72,8 +69,22 @@ INPUT_LIST = ["HDMI", "USB", "Bluetooth", "AUX"]
 
 CURRENT_APP = "Hulu"
 CURRENT_APP_CONFIG = {CONF_APP_ID: "3", CONF_NAME_SPACE: 4, CONF_MESSAGE: None}
-APP_LIST = ["Hulu", "Netflix"]
-INPUT_LIST_WITH_APPS = INPUT_LIST + ["CAST"]
+APP_LIST = [
+    {
+        "name": "Hulu",
+        "country": ["*"],
+        "id": ["1"],
+        "config": [{"NAME_SPACE": 4, "APP_ID": "3", "MESSAGE": None}],
+    },
+    {
+        "name": "Netflix",
+        "country": ["*"],
+        "id": ["2"],
+        "config": [{"NAME_SPACE": 1, "APP_ID": "2", "MESSAGE": None}],
+    },
+]
+APP_NAME_LIST = [app["name"] for app in APP_LIST]
+INPUT_LIST_WITH_APPS = [*INPUT_LIST, "CAST"]
 CUSTOM_CONFIG = {CONF_APP_ID: "test", CONF_MESSAGE: None, CONF_NAME_SPACE: 10}
 ADDITIONAL_APP_CONFIG = {
     "name": CURRENT_APP,
@@ -93,7 +104,7 @@ MOCK_PIN_CONFIG = {CONF_PIN: PIN}
 MOCK_USER_VALID_TV_CONFIG = {
     CONF_NAME: NAME,
     CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
+    CONF_DEVICE_CLASS: MediaPlayerDeviceClass.TV,
     CONF_ACCESS_TOKEN: ACCESS_TOKEN,
 }
 
@@ -101,18 +112,10 @@ MOCK_OPTIONS = {
     CONF_VOLUME_STEP: VOLUME_STEP,
 }
 
-MOCK_IMPORT_VALID_TV_CONFIG = {
-    CONF_NAME: NAME,
-    CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
-    CONF_ACCESS_TOKEN: ACCESS_TOKEN,
-    CONF_VOLUME_STEP: VOLUME_STEP,
-}
-
 MOCK_TV_WITH_INCLUDE_CONFIG = {
     CONF_NAME: NAME,
     CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
+    CONF_DEVICE_CLASS: MediaPlayerDeviceClass.TV,
     CONF_ACCESS_TOKEN: ACCESS_TOKEN,
     CONF_VOLUME_STEP: VOLUME_STEP,
     CONF_APPS: {CONF_INCLUDE: [CURRENT_APP]},
@@ -121,7 +124,7 @@ MOCK_TV_WITH_INCLUDE_CONFIG = {
 MOCK_TV_WITH_EXCLUDE_CONFIG = {
     CONF_NAME: NAME,
     CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
+    CONF_DEVICE_CLASS: MediaPlayerDeviceClass.TV,
     CONF_ACCESS_TOKEN: ACCESS_TOKEN,
     CONF_VOLUME_STEP: VOLUME_STEP,
     CONF_APPS: {CONF_EXCLUDE: ["Netflix"]},
@@ -130,33 +133,16 @@ MOCK_TV_WITH_EXCLUDE_CONFIG = {
 MOCK_TV_WITH_ADDITIONAL_APPS_CONFIG = {
     CONF_NAME: NAME,
     CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
+    CONF_DEVICE_CLASS: MediaPlayerDeviceClass.TV,
     CONF_ACCESS_TOKEN: ACCESS_TOKEN,
     CONF_VOLUME_STEP: VOLUME_STEP,
     CONF_APPS: {CONF_ADDITIONAL_CONFIGS: [ADDITIONAL_APP_CONFIG]},
 }
 
-MOCK_SPEAKER_APPS_FAILURE = {
-    CONF_NAME: NAME,
-    CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_SPEAKER,
-    CONF_ACCESS_TOKEN: ACCESS_TOKEN,
-    CONF_VOLUME_STEP: VOLUME_STEP,
-    CONF_APPS: {CONF_ADDITIONAL_CONFIGS: [ADDITIONAL_APP_CONFIG]},
-}
-
-MOCK_TV_APPS_FAILURE = {
-    CONF_NAME: NAME,
-    CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
-    CONF_ACCESS_TOKEN: ACCESS_TOKEN,
-    CONF_VOLUME_STEP: VOLUME_STEP,
-    CONF_APPS: None,
-}
 
 MOCK_TV_APPS_WITH_VALID_APPS_CONFIG = {
     CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
+    CONF_DEVICE_CLASS: MediaPlayerDeviceClass.TV,
     CONF_ACCESS_TOKEN: ACCESS_TOKEN,
     CONF_APPS: {CONF_INCLUDE: [CURRENT_APP]},
 }
@@ -164,13 +150,13 @@ MOCK_TV_APPS_WITH_VALID_APPS_CONFIG = {
 MOCK_TV_CONFIG_NO_TOKEN = {
     CONF_NAME: NAME,
     CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_TV,
+    CONF_DEVICE_CLASS: MediaPlayerDeviceClass.TV,
 }
 
 MOCK_SPEAKER_CONFIG = {
     CONF_NAME: NAME,
     CONF_HOST: HOST,
-    CONF_DEVICE_CLASS: DEVICE_CLASS_SPEAKER,
+    CONF_DEVICE_CLASS: MediaPlayerDeviceClass.SPEAKER,
 }
 
 MOCK_INCLUDE_APPS = {
@@ -185,13 +171,14 @@ MOCK_INCLUDE_NO_APPS = {
 
 VIZIO_ZEROCONF_SERVICE_TYPE = "_viziocast._tcp.local."
 ZEROCONF_NAME = f"{NAME}.{VIZIO_ZEROCONF_SERVICE_TYPE}"
-ZEROCONF_HOST = HOST.split(":")[0]
-ZEROCONF_PORT = HOST.split(":")[1]
+ZEROCONF_HOST, ZEROCONF_PORT = HOST.split(":", maxsplit=2)
 
-MOCK_ZEROCONF_SERVICE_INFO = {
-    CONF_TYPE: VIZIO_ZEROCONF_SERVICE_TYPE,
-    CONF_NAME: ZEROCONF_NAME,
-    CONF_HOST: ZEROCONF_HOST,
-    CONF_PORT: ZEROCONF_PORT,
-    "properties": {"name": "SB4031-D5"},
-}
+MOCK_ZEROCONF_SERVICE_INFO = zeroconf.ZeroconfServiceInfo(
+    ip_address=ip_address(ZEROCONF_HOST),
+    ip_addresses=[ip_address(ZEROCONF_HOST)],
+    hostname="mock_hostname",
+    name=ZEROCONF_NAME,
+    port=ZEROCONF_PORT,
+    properties={"name": "SB4031-D5"},
+    type=VIZIO_ZEROCONF_SERVICE_TYPE,
+)

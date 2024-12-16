@@ -1,108 +1,205 @@
 """Config flow for Tuya."""
-import logging
 
-from tuyaha import TuyaApi
-from tuyaha.tuyaapi import TuyaAPIException, TuyaNetException, TuyaServerException
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from tuya_sharing import LoginControl
 import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.const import CONF_PASSWORD, CONF_PLATFORM, CONF_USERNAME
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.helpers import selector
 
-# pylint:disable=unused-import
-from .const import CONF_COUNTRYCODE, DOMAIN, TUYA_PLATFORMS
-
-_LOGGER = logging.getLogger(__name__)
-
-DATA_SCHEMA_USER = vol.Schema(
-    {
-        vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
-        vol.Required(CONF_COUNTRYCODE): vol.Coerce(int),
-        vol.Required(CONF_PLATFORM): vol.In(TUYA_PLATFORMS),
-    }
+from .const import (
+    CONF_ENDPOINT,
+    CONF_TERMINAL_ID,
+    CONF_TOKEN_INFO,
+    CONF_USER_CODE,
+    DOMAIN,
+    TUYA_CLIENT_ID,
+    TUYA_RESPONSE_CODE,
+    TUYA_RESPONSE_MSG,
+    TUYA_RESPONSE_QR_CODE,
+    TUYA_RESPONSE_RESULT,
+    TUYA_RESPONSE_SUCCESS,
+    TUYA_SCHEMA,
 )
 
-RESULT_AUTH_FAILED = "auth_failed"
-RESULT_CONN_ERROR = "conn_error"
-RESULT_SUCCESS = "success"
 
-RESULT_LOG_MESSAGE = {
-    RESULT_AUTH_FAILED: "Invalid credential",
-    RESULT_CONN_ERROR: "Connection error",
-}
+class TuyaConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Tuya config flow."""
 
+    __user_code: str
+    __qr_code: str
 
-class TuyaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a tuya config flow."""
+    def __init__(self) -> None:
+        """Initialize the config flow."""
+        self.__login_control = LoginControl()
 
-    VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
-
-    def __init__(self):
-        """Initialize flow."""
-        self._country_code = None
-        self._password = None
-        self._platform = None
-        self._username = None
-        self._is_import = False
-
-    def _get_entry(self):
-        return self.async_create_entry(
-            title=self._username,
-            data={
-                CONF_COUNTRYCODE: self._country_code,
-                CONF_PASSWORD: self._password,
-                CONF_PLATFORM: self._platform,
-                CONF_USERNAME: self._username,
-            },
-        )
-
-    def _try_connect(self):
-        """Try to connect and check auth."""
-        tuya = TuyaApi()
-        try:
-            tuya.init(
-                self._username, self._password, self._country_code, self._platform
-            )
-        except (TuyaNetException, TuyaServerException):
-            return RESULT_CONN_ERROR
-        except TuyaAPIException:
-            return RESULT_AUTH_FAILED
-
-        return RESULT_SUCCESS
-
-    async def async_step_import(self, user_input=None):
-        """Handle configuration by yaml file."""
-        self._is_import = True
-        return await self.async_step_user(user_input)
-
-    async def async_step_user(self, user_input=None):
-        """Handle a flow initialized by the user."""
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
-
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step user."""
         errors = {}
+        placeholders = {}
 
         if user_input is not None:
+            success, response = await self.__async_get_qr_code(
+                user_input[CONF_USER_CODE]
+            )
+            if success:
+                return await self.async_step_scan()
 
-            self._country_code = str(user_input[CONF_COUNTRYCODE])
-            self._password = user_input[CONF_PASSWORD]
-            self._platform = user_input[CONF_PLATFORM]
-            self._username = user_input[CONF_USERNAME]
-
-            result = await self.hass.async_add_executor_job(self._try_connect)
-
-            if result == RESULT_SUCCESS:
-                return self._get_entry()
-            if result != RESULT_AUTH_FAILED or self._is_import:
-                if self._is_import:
-                    _LOGGER.error(
-                        "Error importing from configuration.yaml: %s",
-                        RESULT_LOG_MESSAGE.get(result, "Generic Error"),
-                    )
-                return self.async_abort(reason=result)
-            errors["base"] = result
+            errors["base"] = "login_error"
+            placeholders = {
+                TUYA_RESPONSE_MSG: response.get(TUYA_RESPONSE_MSG, "Unknown error"),
+                TUYA_RESPONSE_CODE: response.get(TUYA_RESPONSE_CODE, "0"),
+            }
+        else:
+            user_input = {}
 
         return self.async_show_form(
-            step_id="user", data_schema=DATA_SCHEMA_USER, errors=errors
+            step_id="user",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_USER_CODE, default=user_input.get(CONF_USER_CODE, "")
+                    ): str,
+                }
+            ),
+            errors=errors,
+            description_placeholders=placeholders,
         )
+
+    async def async_step_scan(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step scan."""
+        if user_input is None:
+            return self.async_show_form(
+                step_id="scan",
+                data_schema=vol.Schema(
+                    {
+                        vol.Optional("QR"): selector.QrCodeSelector(
+                            config=selector.QrCodeSelectorConfig(
+                                data=f"tuyaSmart--qrLogin?token={self.__qr_code}",
+                                scale=5,
+                                error_correction_level=selector.QrErrorCorrectionLevel.QUARTILE,
+                            )
+                        )
+                    }
+                ),
+            )
+
+        ret, info = await self.hass.async_add_executor_job(
+            self.__login_control.login_result,
+            self.__qr_code,
+            TUYA_CLIENT_ID,
+            self.__user_code,
+        )
+        if not ret:
+            # Try to get a new QR code on failure
+            await self.__async_get_qr_code(self.__user_code)
+            return self.async_show_form(
+                step_id="scan",
+                errors={"base": "login_error"},
+                data_schema=vol.Schema(
+                    {
+                        vol.Optional("QR"): selector.QrCodeSelector(
+                            config=selector.QrCodeSelectorConfig(
+                                data=f"tuyaSmart--qrLogin?token={self.__qr_code}",
+                                scale=5,
+                                error_correction_level=selector.QrErrorCorrectionLevel.QUARTILE,
+                            )
+                        )
+                    }
+                ),
+                description_placeholders={
+                    TUYA_RESPONSE_MSG: info.get(TUYA_RESPONSE_MSG, "Unknown error"),
+                    TUYA_RESPONSE_CODE: info.get(TUYA_RESPONSE_CODE, 0),
+                },
+            )
+
+        entry_data = {
+            CONF_USER_CODE: self.__user_code,
+            CONF_TOKEN_INFO: {
+                "t": info["t"],
+                "uid": info["uid"],
+                "expire_time": info["expire_time"],
+                "access_token": info["access_token"],
+                "refresh_token": info["refresh_token"],
+            },
+            CONF_TERMINAL_ID: info[CONF_TERMINAL_ID],
+            CONF_ENDPOINT: info[CONF_ENDPOINT],
+        }
+
+        if self.source == SOURCE_REAUTH:
+            return self.async_update_reload_and_abort(
+                self._get_reauth_entry(),
+                data=entry_data,
+            )
+
+        return self.async_create_entry(
+            title=info.get("username"),
+            data=entry_data,
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle initiation of re-authentication with Tuya."""
+        if CONF_USER_CODE in entry_data:
+            success, _ = await self.__async_get_qr_code(entry_data[CONF_USER_CODE])
+            if success:
+                return await self.async_step_scan()
+
+        return await self.async_step_reauth_user_code()
+
+    async def async_step_reauth_user_code(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle re-authentication with a Tuya."""
+        errors = {}
+        placeholders = {}
+
+        if user_input is not None:
+            success, response = await self.__async_get_qr_code(
+                user_input[CONF_USER_CODE]
+            )
+            if success:
+                return await self.async_step_scan()
+
+            errors["base"] = "login_error"
+            placeholders = {
+                TUYA_RESPONSE_MSG: response.get(TUYA_RESPONSE_MSG, "Unknown error"),
+                TUYA_RESPONSE_CODE: response.get(TUYA_RESPONSE_CODE, "0"),
+            }
+        else:
+            user_input = {}
+
+        return self.async_show_form(
+            step_id="reauth_user_code",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_USER_CODE, default=user_input.get(CONF_USER_CODE, "")
+                    ): str,
+                }
+            ),
+            errors=errors,
+            description_placeholders=placeholders,
+        )
+
+    async def __async_get_qr_code(self, user_code: str) -> tuple[bool, dict[str, Any]]:
+        """Get the QR code."""
+        response = await self.hass.async_add_executor_job(
+            self.__login_control.qr_code,
+            TUYA_CLIENT_ID,
+            TUYA_SCHEMA,
+            user_code,
+        )
+        if success := response.get(TUYA_RESPONSE_SUCCESS, False):
+            self.__user_code = user_code
+            self.__qr_code = response[TUYA_RESPONSE_RESULT][TUYA_RESPONSE_QR_CODE]
+        return success, response

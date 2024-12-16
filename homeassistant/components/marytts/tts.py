@@ -1,14 +1,17 @@
 """Support for the MaryTTS service."""
-import logging
+
+from __future__ import annotations
 
 from speak2mary import MaryTTS
 import voluptuous as vol
 
-from homeassistant.components.tts import CONF_LANG, PLATFORM_SCHEMA, Provider
+from homeassistant.components.tts import (
+    CONF_LANG,
+    PLATFORM_SCHEMA as TTS_PLATFORM_SCHEMA,
+    Provider,
+)
 from homeassistant.const import CONF_EFFECT, CONF_HOST, CONF_PORT
 import homeassistant.helpers.config_validation as cv
-
-_LOGGER = logging.getLogger(__name__)
 
 CONF_VOICE = "voice"
 CONF_CODEC = "codec"
@@ -23,9 +26,11 @@ DEFAULT_PORT = 59125
 DEFAULT_LANG = "en_US"
 DEFAULT_VOICE = "cmu-slt-hsmm"
 DEFAULT_CODEC = "WAVE_FILE"
-DEFAULT_EFFECTS = {}
+DEFAULT_EFFECTS: dict[str, str] = {}
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+MAP_MARYTTS_CODEC = {"WAVE_FILE": "wav", "AIFF_FILE": "aiff", "AU_FILE": "au"}
+
+PLATFORM_SCHEMA = TTS_PLATFORM_SCHEMA.extend(
     {
         vol.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
@@ -39,7 +44,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
-async def async_get_engine(hass, config, discovery_info=None):
+def get_engine(hass, config, discovery_info=None):
     """Set up MaryTTS speech component."""
     return MaryTTSProvider(hass, config)
 
@@ -80,10 +85,11 @@ class MaryTTSProvider(Provider):
         """Return a list of supported options."""
         return SUPPORT_OPTIONS
 
-    async def async_get_tts_audio(self, message, language, options=None):
+    def get_tts_audio(self, message, language, options):
         """Load TTS from MaryTTS."""
         effects = options[CONF_EFFECT]
 
         data = self._mary.speak(message, effects)
+        audiotype = MAP_MARYTTS_CODEC[self._mary.codec]
 
-        return self._mary.codec, data
+        return audiotype, data

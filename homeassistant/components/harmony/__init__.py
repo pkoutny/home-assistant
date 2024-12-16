@@ -1,32 +1,20 @@
 """The Logitech Harmony Hub integration."""
-import asyncio
+
 import logging
 
-from homeassistant.components.remote import (
-    ATTR_ACTIVITY,
-    ATTR_DELAY_SECS,
-    DEFAULT_DELAY_SECS,
-)
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_NAME
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.components.remote import ATTR_ACTIVITY, ATTR_DELAY_SECS
+from homeassistant.const import CONF_HOST, CONF_NAME, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import ATTR_ACTIVITY_NOTIFY, DOMAIN, HARMONY_OPTIONS_UPDATE, PLATFORMS
-from .remote import HarmonyRemote
+from .const import HARMONY_OPTIONS_UPDATE, PLATFORMS
+from .data import HarmonyConfigEntry, HarmonyData
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the Logitech Harmony Hub component."""
-    hass.data.setdefault(DOMAIN, {})
-
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: HarmonyConfigEntry) -> bool:
     """Set up Logitech Harmony Hub from a config entry."""
     # As there currently is no way to import options from yaml
     # when setting up a config entry, we fallback to adding
@@ -36,45 +24,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     address = entry.data[CONF_HOST]
     name = entry.data[CONF_NAME]
-    activity = entry.options.get(ATTR_ACTIVITY)
-    delay_secs = entry.options.get(ATTR_DELAY_SECS, DEFAULT_DELAY_SECS)
-    activity_notify = entry.options.get(ATTR_ACTIVITY_NOTIFY, False)
+    data = HarmonyData(hass, address, name, entry.unique_id)
+    await data.connect()
 
-    harmony_conf_file = hass.config.path(f"harmony_{entry.unique_id}.conf")
-    try:
-        device = HarmonyRemote(
-            name,
-            entry.unique_id,
-            address,
-            activity,
-            harmony_conf_file,
-            delay_secs,
-            activity_notify,
-        )
-        connected_ok = await device.connect()
-    except (asyncio.TimeoutError, ValueError, AttributeError):
-        raise ConfigEntryNotReady
+    await _migrate_old_unique_ids(hass, entry.entry_id, data)
 
-    if not connected_ok:
-        raise ConfigEntryNotReady
+    entry.async_on_unload(entry.add_update_listener(_update_listener))
 
-    hass.data[DOMAIN][entry.entry_id] = device
+    async def _async_on_stop(event: Event) -> None:
+        await data.shutdown()
 
-    entry.add_update_listener(_update_listener)
+    entry.async_on_unload(
+        hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, _async_on_stop)
+    )
 
-    for component in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
-        )
+    entry.runtime_data = data
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
+async def _migrate_old_unique_ids(
+    hass: HomeAssistant, entry_id: str, data: HarmonyData
+) -> None:
+    names_to_ids = {activity["label"]: activity["id"] for activity in data.activities}
+
+    @callback
+    def _async_migrator(entity_entry: er.RegistryEntry) -> dict[str, str] | None:
+        # Old format for switches was {remote_unique_id}-{activity_name}
+        # New format is activity_{activity_id}
+        parts = entity_entry.unique_id.split("-", 1)
+        if len(parts) > 1:  # old format
+            activity_name = parts[1]
+            activity_id = names_to_ids.get(activity_name)
+
+            if activity_id is not None:
+                _LOGGER.debug(
+                    "Migrating unique_id from [%s] to [%s]",
+                    entity_entry.unique_id,
+                    activity_id,
+                )
+                return {"new_unique_id": f"activity_{activity_id}"}
+
+        return None
+
+    await er.async_migrate_entries(hass, entry_id, _async_migrator)
+
+
 @callback
-def _async_import_options_from_data_if_missing(hass: HomeAssistant, entry: ConfigEntry):
+def _async_import_options_from_data_if_missing(
+    hass: HomeAssistant, entry: HarmonyConfigEntry
+) -> None:
     options = dict(entry.options)
     modified = 0
-    for importable_option in [ATTR_ACTIVITY, ATTR_DELAY_SECS]:
+    for importable_option in (ATTR_ACTIVITY, ATTR_DELAY_SECS):
         if importable_option not in entry.options and importable_option in entry.data:
             options[importable_option] = entry.data[importable_option]
             modified = 1
@@ -83,29 +86,16 @@ def _async_import_options_from_data_if_missing(hass: HomeAssistant, entry: Confi
         hass.config_entries.async_update_entry(entry, options=options)
 
 
-async def _update_listener(hass: HomeAssistant, entry: ConfigEntry):
+async def _update_listener(hass: HomeAssistant, entry: HarmonyConfigEntry) -> None:
     """Handle options update."""
     async_dispatcher_send(
         hass, f"{HARMONY_OPTIONS_UPDATE}-{entry.unique_id}", entry.options
     )
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: HarmonyConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in PLATFORMS
-            ]
-        )
-    )
-
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     # Shutdown a harmony remote for removal
-    device = hass.data[DOMAIN][entry.entry_id]
-    await device.shutdown()
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
+    await entry.runtime_data.shutdown()
     return unload_ok

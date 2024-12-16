@@ -1,5 +1,8 @@
 """Support for functionality to download files."""
-import logging
+
+from __future__ import annotations
+
+from http import HTTPStatus
 import os
 import re
 import threading
@@ -7,59 +10,44 @@ import threading
 import requests
 import voluptuous as vol
 
-from homeassistant.const import HTTP_OK
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
-from homeassistant.util import sanitize_filename
+from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.util import raise_if_invalid_filename, raise_if_invalid_path
 
-_LOGGER = logging.getLogger(__name__)
-
-ATTR_FILENAME = "filename"
-ATTR_SUBDIR = "subdir"
-ATTR_URL = "url"
-ATTR_OVERWRITE = "overwrite"
-
-CONF_DOWNLOAD_DIR = "download_dir"
-
-DOMAIN = "downloader"
-DOWNLOAD_FAILED_EVENT = "download_failed"
-DOWNLOAD_COMPLETED_EVENT = "download_completed"
-
-SERVICE_DOWNLOAD_FILE = "download_file"
-
-SERVICE_DOWNLOAD_FILE_SCHEMA = vol.Schema(
-    {
-        vol.Required(ATTR_URL): cv.url,
-        vol.Optional(ATTR_SUBDIR): cv.string,
-        vol.Optional(ATTR_FILENAME): cv.string,
-        vol.Optional(ATTR_OVERWRITE, default=False): cv.boolean,
-    }
-)
-
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: vol.Schema({vol.Required(CONF_DOWNLOAD_DIR): cv.string})},
-    extra=vol.ALLOW_EXTRA,
+from .const import (
+    _LOGGER,
+    ATTR_FILENAME,
+    ATTR_OVERWRITE,
+    ATTR_SUBDIR,
+    ATTR_URL,
+    CONF_DOWNLOAD_DIR,
+    DOMAIN,
+    DOWNLOAD_COMPLETED_EVENT,
+    DOWNLOAD_FAILED_EVENT,
+    SERVICE_DOWNLOAD_FILE,
 )
 
 
-def setup(hass, config):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Listen for download events to download files."""
-    download_path = config[DOMAIN][CONF_DOWNLOAD_DIR]
+    download_path = entry.data[CONF_DOWNLOAD_DIR]
 
     # If path is relative, we assume relative to Home Assistant config dir
     if not os.path.isabs(download_path):
         download_path = hass.config.path(download_path)
 
-    if not os.path.isdir(download_path):
+    if not await hass.async_add_executor_job(os.path.isdir, download_path):
         _LOGGER.error(
             "Download path %s does not exist. File Downloader not active", download_path
         )
-
         return False
 
-    def download_file(service):
+    def download_file(service: ServiceCall) -> None:
         """Start thread to download file specified in the URL."""
 
-        def do_download():
+        def do_download() -> None:
             """Download the file."""
             try:
                 url = service.data[ATTR_URL]
@@ -71,15 +59,16 @@ def setup(hass, config):
                 overwrite = service.data.get(ATTR_OVERWRITE)
 
                 if subdir:
-                    subdir = sanitize_filename(subdir)
+                    # Check the path
+                    raise_if_invalid_path(subdir)
 
                 final_path = None
 
                 req = requests.get(url, stream=True, timeout=10)
 
-                if req.status_code != HTTP_OK:
+                if req.status_code != HTTPStatus.OK:
                     _LOGGER.warning(
-                        "downloading '%s' failed, status_code=%d", url, req.status_code
+                        "Downloading '%s' failed, status_code=%d", url, req.status_code
                     )
                     hass.bus.fire(
                         f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
@@ -101,16 +90,15 @@ def setup(hass, config):
                     if not filename:
                         filename = "ha_download"
 
-                    # Remove stuff to ruin paths
-                    filename = sanitize_filename(filename)
+                    # Check the filename
+                    raise_if_invalid_filename(filename)
 
                     # Do we want to download to subdir, create if needed
                     if subdir:
                         subdir_path = os.path.join(download_path, subdir)
 
                         # Ensure subdir exist
-                        if not os.path.isdir(subdir_path):
-                            os.makedirs(subdir_path)
+                        os.makedirs(subdir_path, exist_ok=True)
 
                         final_path = os.path.join(subdir_path, filename)
 
@@ -151,14 +139,32 @@ def setup(hass, config):
                 # Remove file if we started downloading but failed
                 if final_path and os.path.isfile(final_path):
                     os.remove(final_path)
+            except ValueError:
+                _LOGGER.exception("Invalid value")
+                hass.bus.fire(
+                    f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
+                    {"url": url, "filename": filename},
+                )
+
+                # Remove file if we started downloading but failed
+                if final_path and os.path.isfile(final_path):
+                    os.remove(final_path)
 
         threading.Thread(target=do_download).start()
 
-    hass.services.register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_DOWNLOAD_FILE,
         download_file,
-        schema=SERVICE_DOWNLOAD_FILE_SCHEMA,
+        schema=vol.Schema(
+            {
+                vol.Optional(ATTR_FILENAME): cv.string,
+                vol.Optional(ATTR_SUBDIR): cv.string,
+                vol.Required(ATTR_URL): cv.url,
+                vol.Optional(ATTR_OVERWRITE, default=False): cv.boolean,
+            }
+        ),
     )
 
     return True

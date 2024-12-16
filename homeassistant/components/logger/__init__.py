@@ -1,35 +1,36 @@
 """Support for setting the level of logging for components."""
+
+from __future__ import annotations
+
 import logging
 import re
 
 import voluptuous as vol
 
+from homeassistant.const import EVENT_LOGGING_CHANGED  # noqa: F401
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
-DOMAIN = "logger"
+from . import websocket_api
+from .const import (
+    ATTR_LEVEL,
+    DOMAIN,
+    LOGGER_DEFAULT,
+    LOGGER_FILTERS,
+    LOGGER_LOGS,
+    LOGSEVERITY,
+    SERVICE_SET_DEFAULT_LEVEL,
+    SERVICE_SET_LEVEL,
+)
+from .helpers import (
+    LoggerDomainConfig,
+    LoggerSettings,
+    set_default_log_level,
+    set_log_levels,
+)
 
-DATA_LOGGER = "logger"
-
-SERVICE_SET_DEFAULT_LEVEL = "set_default_level"
-SERVICE_SET_LEVEL = "set_level"
-
-LOGSEVERITY = {
-    "CRITICAL": 50,
-    "FATAL": 50,
-    "ERROR": 40,
-    "WARNING": 30,
-    "WARN": 30,
-    "INFO": 20,
-    "DEBUG": 10,
-    "NOTSET": 0,
-}
-
-LOGGER_DEFAULT = "default"
-LOGGER_LOGS = "logs"
-
-ATTR_LEVEL = "level"
-
-_VALID_LOG_LEVEL = vol.All(vol.Upper, vol.In(LOGSEVERITY))
+_VALID_LOG_LEVEL = vol.All(vol.Upper, vol.In(LOGSEVERITY), LOGSEVERITY.__getitem__)
 
 SERVICE_SET_DEFAULT_LEVEL_SCHEMA = vol.Schema({ATTR_LEVEL: _VALID_LOG_LEVEL})
 SERVICE_SET_LEVEL_SCHEMA = vol.Schema({cv.string: _VALID_LOG_LEVEL})
@@ -40,6 +41,7 @@ CONFIG_SCHEMA = vol.Schema(
             {
                 vol.Optional(LOGGER_DEFAULT): _VALID_LOG_LEVEL,
                 vol.Optional(LOGGER_LOGS): vol.Schema({cv.string: _VALID_LOG_LEVEL}),
+                vol.Optional(LOGGER_FILTERS): vol.Schema({cv.string: [cv.is_regex]}),
             }
         )
     },
@@ -47,97 +49,40 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-class HomeAssistantLogFilter(logging.Filter):
-    """A log filter."""
-
-    def __init__(self):
-        """Initialize the filter."""
-        super().__init__()
-
-        self._default = None
-        self._logs = None
-        self._log_rx = None
-
-    def update_default_level(self, default_level):
-        """Update the default logger level."""
-        self._default = default_level
-
-    def update_log_filter(self, logs):
-        """Rebuild the internal filter from new config."""
-        #
-        # A precompiled regex is used to avoid
-        # the overhead of a list transversal
-        #
-        # Sort to make sure the longer
-        # names are always matched first
-        # so they take precedence of the shorter names
-        # to allow for more granular settings.
-        #
-        names_by_len = sorted(list(logs), key=len, reverse=True)
-        self._log_rx = re.compile("".join(["^(?:", "|".join(names_by_len), ")"]))
-        self._logs = logs
-
-    def filter(self, record):
-        """Filter the log entries."""
-        # Log with filtered severity
-        if self._log_rx:
-            match = self._log_rx.match(record.name)
-            if match:
-                return record.levelno >= self._logs[match.group(0)]
-
-        # Log with default severity
-        return record.levelno >= self._default
-
-
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the logger component."""
-    logfilter = {}
-    hass_filter = HomeAssistantLogFilter()
 
-    def set_default_log_level(level):
-        """Set the default log level for components."""
-        logfilter[LOGGER_DEFAULT] = LOGSEVERITY[level]
-        hass_filter.update_default_level(LOGSEVERITY[level])
+    settings = LoggerSettings(hass, config)
 
-    def set_log_levels(logpoints):
-        """Set the specified log levels."""
-        logs = {}
+    domain_config = hass.data[DOMAIN] = LoggerDomainConfig({}, settings)
+    logging.setLoggerClass(_get_logger_class(domain_config.overrides))
 
-        # Preserve existing logs
-        if LOGGER_LOGS in logfilter:
-            logs.update(logfilter[LOGGER_LOGS])
+    websocket_api.async_load_websocket_api(hass)
 
-        # Add new logpoints mapped to correct severity
-        for key, value in logpoints.items():
-            logs[key] = LOGSEVERITY[value]
+    await settings.async_load()
 
-        logfilter[LOGGER_LOGS] = logs
+    # Set default log severity and filter
+    logger_config = config.get(DOMAIN, {})
 
-        hass_filter.update_log_filter(logs)
+    if LOGGER_DEFAULT in logger_config:
+        set_default_log_level(hass, logger_config[LOGGER_DEFAULT])
 
-    # Set default log severity
-    if LOGGER_DEFAULT in config.get(DOMAIN):
-        set_default_log_level(config.get(DOMAIN)[LOGGER_DEFAULT])
-    else:
-        set_default_log_level("DEBUG")
+    if LOGGER_FILTERS in logger_config:
+        log_filters: dict[str, list[re.Pattern]] = logger_config[LOGGER_FILTERS]
+        for key, value in log_filters.items():
+            _add_log_filter(logging.getLogger(key), value)
 
-    logger = logging.getLogger("")
-    logger.setLevel(logging.NOTSET)
+    # Combine log levels configured in configuration.yaml with log levels set by frontend
+    combined_logs = await settings.async_get_levels(hass)
+    set_log_levels(hass, combined_logs)
 
-    # Set log filter for all log handler
-    for handler in logging.root.handlers:
-        handler.setLevel(logging.NOTSET)
-        handler.addFilter(hass_filter)
-
-    if LOGGER_LOGS in config.get(DOMAIN):
-        set_log_levels(config.get(DOMAIN)[LOGGER_LOGS])
-
-    async def async_service_handler(service):
+    @callback
+    def async_service_handler(service: ServiceCall) -> None:
         """Handle logger services."""
         if service.service == SERVICE_SET_DEFAULT_LEVEL:
-            set_default_log_level(service.data.get(ATTR_LEVEL))
+            set_default_log_level(hass, service.data[ATTR_LEVEL])
         else:
-            set_log_levels(service.data)
+            set_log_levels(hass, service.data)
 
     hass.services.async_register(
         DOMAIN,
@@ -154,3 +99,36 @@ async def async_setup(hass, config):
     )
 
     return True
+
+
+def _add_log_filter(logger: logging.Logger, patterns: list[re.Pattern]) -> None:
+    """Add a Filter to the logger based on a regexp of the filter_str."""
+
+    def filter_func(logrecord: logging.LogRecord) -> bool:
+        return not any(p.search(logrecord.getMessage()) for p in patterns)
+
+    logger.addFilter(filter_func)
+
+
+def _get_logger_class(hass_overrides: dict[str, int]) -> type[logging.Logger]:
+    """Create a logger subclass.
+
+    logging.setLoggerClass checks if it is a subclass of Logger and
+    so we cannot use partial to inject hass_overrides.
+    """
+
+    class HassLogger(logging.Logger):
+        """Home Assistant aware logger class."""
+
+        def setLevel(self, level: int | str) -> None:
+            """Set the log level unless overridden."""
+            if self.name in hass_overrides:
+                return
+
+            super().setLevel(level)
+
+        def orig_setLevel(self, level: int | str) -> None:
+            """Set the log level."""
+            super().setLevel(level)
+
+    return HassLogger
